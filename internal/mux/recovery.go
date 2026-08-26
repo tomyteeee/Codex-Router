@@ -1,0 +1,1614 @@
+package mux
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/b-nnett/codex-subscription-router/internal/backend"
+	"github.com/b-nnett/codex-subscription-router/internal/protocol"
+	"github.com/b-nnett/codex-subscription-router/internal/state"
+)
+
+const (
+	quotaBlockFallback      = 2 * time.Minute
+	recoveryWatchInterval   = 30 * time.Second
+	recoveryStallThreshold  = 90 * time.Second
+	recoveryRetryInterval   = 30 * time.Second
+	recoveryInterruptWindow = 2 * time.Second
+	recoveryFlushDelay      = 250 * time.Millisecond
+)
+
+type threadStartMeta struct {
+	ID       string
+	ParentID string
+}
+
+type turnStartMeta struct {
+	ThreadID string
+	TurnID   string
+}
+
+type threadRecoveryData struct {
+	Path          string
+	CWD           string
+	ModelProvider string
+}
+
+func (m *Multiplexer) accountQuotaBlocked(accountID string) bool {
+	m.quotaMu.Lock()
+	defer m.quotaMu.Unlock()
+
+	until, ok := m.quotaBlocked[accountID]
+	if !ok {
+		return false
+	}
+	if !m.now().Before(until) {
+		delete(m.quotaBlocked, accountID)
+		return false
+	}
+	return true
+}
+
+func (m *Multiplexer) markAccountQuotaBlocked(accountID string) {
+	if accountID == "" {
+		return
+	}
+
+	now := m.now()
+	until := now.Add(quotaBlockFallback)
+
+	m.quotaMu.Lock()
+	if existing := m.quotaBlocked[accountID]; existing.After(until) {
+		until = existing
+	}
+	m.quotaBlocked[accountID] = until
+	m.quotaMu.Unlock()
+
+	// Refine the temporary block to the server-provided reset time when
+	// possible. The short fallback prevents a stale successful snapshot from
+	// routing another turn straight back to an account that just rejected one.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		snapshot, err := m.accountSnapshotWithProfile(ctx, accountID, false)
+		if err != nil || snapshot.RateLimits == nil {
+			return
+		}
+
+		refined := until
+		for _, window := range rateLimitWindows(snapshot.RateLimits) {
+			if window == nil || window.UsedPercent < 100 || window.ResetsAt == nil {
+				continue
+			}
+			reset := time.Unix(*window.ResetsAt, 0)
+			if reset.After(refined) {
+				refined = reset
+			}
+		}
+
+		m.quotaMu.Lock()
+		if existing := m.quotaBlocked[accountID]; refined.After(existing) {
+			m.quotaBlocked[accountID] = refined
+		}
+		m.quotaMu.Unlock()
+	}()
+}
+
+func (m *Multiplexer) recordThreadStarted(accountID string, params json.RawMessage) threadStartMeta {
+	var decoded struct {
+		Thread struct {
+			ID             string `json:"id"`
+			ParentThreadID string `json:"parentThreadId"`
+		} `json:"thread"`
+	}
+	if json.Unmarshal(params, &decoded) != nil || decoded.Thread.ID == "" {
+		return threadStartMeta{}
+	}
+
+	threadID := decoded.Thread.ID
+	parentID := decoded.Thread.ParentThreadID
+
+	if parentID != "" {
+		m.lineageMu.Lock()
+		m.threadParents[threadID] = parentID
+		m.lineageMu.Unlock()
+	}
+
+	// Notifications can arrive late after a migration. Learn ownership only
+	// for genuinely new threads; explicit failover is the authority for an
+	// already-known thread.
+	if _, exists := m.store.ThreadOwner(threadID); !exists {
+		_ = m.store.SetThreadOwner(threadID, accountID)
+	}
+
+	return threadStartMeta{ID: threadID, ParentID: parentID}
+}
+
+func parseTurnStarted(params json.RawMessage) turnStartMeta {
+	var decoded struct {
+		ThreadID string `json:"threadId"`
+		Turn     struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if json.Unmarshal(params, &decoded) != nil {
+		return turnStartMeta{}
+	}
+	return turnStartMeta{ThreadID: decoded.ThreadID, TurnID: decoded.Turn.ID}
+}
+
+func (m *Multiplexer) recordTurnStarted(accountID string, params json.RawMessage) turnStartMeta {
+	meta := parseTurnStarted(params)
+	if meta.ThreadID == "" {
+		return meta
+	}
+
+	now := m.now()
+	m.activeTurnMu.Lock()
+	active, ok := m.activeTurns[meta.ThreadID]
+	if !ok {
+		active = activeTurn{}
+	}
+	// A target turn/started can race the internal turn/start response during
+	// recovery. Do not change the committed source owner until the recovery
+	// path has received a successful turn/start response and persisted it.
+	if !active.recovering || active.accountID == "" || active.accountID == accountID {
+		active.accountID = accountID
+	}
+	active.turnID = meta.TurnID
+	active.lastActivity = now
+	active.parked = false
+	m.activeTurns[meta.ThreadID] = active
+	m.activeTurnMu.Unlock()
+
+	return meta
+}
+
+func threadIDFromInboundNotification(method string, params json.RawMessage) string {
+	if method == "thread/started" {
+		var decoded struct {
+			Thread struct {
+				ID string `json:"id"`
+			} `json:"thread"`
+		}
+		if json.Unmarshal(params, &decoded) == nil {
+			return decoded.Thread.ID
+		}
+		return ""
+	}
+
+	var decoded struct {
+		ThreadID string `json:"threadId"`
+	}
+	if json.Unmarshal(params, &decoded) == nil {
+		return decoded.ThreadID
+	}
+	return ""
+}
+
+func (m *Multiplexer) touchThread(threadID, accountID string) {
+	if threadID == "" {
+		return
+	}
+	m.activeTurnMu.Lock()
+	if active, ok := m.activeTurns[threadID]; ok {
+		if accountID == "" || active.accountID == "" || active.accountID == accountID {
+			active.lastActivity = m.now()
+			m.activeTurns[threadID] = active
+		}
+	}
+	m.activeTurnMu.Unlock()
+}
+
+func (m *Multiplexer) rootThreadID(threadID string) string {
+	if threadID == "" {
+		return ""
+	}
+	seen := make(map[string]struct{})
+	current := threadID
+
+	m.lineageMu.RLock()
+	defer m.lineageMu.RUnlock()
+
+	for depth := 0; depth < 64; depth++ {
+		if _, exists := seen[current]; exists {
+			break
+		}
+		seen[current] = struct{}{}
+		parent := m.threadParents[current]
+		if parent == "" {
+			break
+		}
+		current = parent
+	}
+	return current
+}
+
+func (m *Multiplexer) treeThreadIDs(root string) []string {
+	if root == "" {
+		return nil
+	}
+
+	m.lineageMu.RLock()
+	parents := make(map[string]string, len(m.threadParents))
+	for child, parent := range m.threadParents {
+		parents[child] = parent
+	}
+	m.lineageMu.RUnlock()
+
+	result := []string{root}
+	seen := map[string]struct{}{root: {}}
+
+	for changed := true; changed; {
+		changed = false
+		for child, parent := range parents {
+			if _, already := seen[child]; already {
+				continue
+			}
+			if _, parentKnown := seen[parent]; !parentKnown {
+				continue
+			}
+			seen[child] = struct{}{}
+			result = append(result, child)
+			changed = true
+		}
+	}
+	return result
+}
+
+func (m *Multiplexer) markTreeSourceStale(root, accountID string) {
+	if root == "" || accountID == "" {
+		return
+	}
+	m.staleMu.Lock()
+	defer m.staleMu.Unlock()
+
+	for _, threadID := range m.treeThreadIDs(root) {
+		set := m.staleSources[threadID]
+		if set == nil {
+			set = make(map[string]struct{})
+			m.staleSources[threadID] = set
+		}
+		set[accountID] = struct{}{}
+	}
+}
+
+func (m *Multiplexer) clearStaleSource(threadID, accountID string) {
+	m.staleMu.Lock()
+	defer m.staleMu.Unlock()
+	if set := m.staleSources[threadID]; set != nil {
+		delete(set, accountID)
+		if len(set) == 0 {
+			delete(m.staleSources, threadID)
+		}
+	}
+}
+
+func (m *Multiplexer) inboundSourceIsStale(accountID, method string, params json.RawMessage) bool {
+	threadID := threadIDFromInboundNotification(method, params)
+	if threadID == "" {
+		return false
+	}
+	m.staleMu.RLock()
+	_, stale := m.staleSources[threadID][accountID]
+	m.staleMu.RUnlock()
+	return stale
+}
+
+func (m *Multiplexer) beginRecovery(threadID, sourceAccountID string) (activeTurn, bool) {
+	root := m.rootThreadID(threadID)
+	if root == "" {
+		root = threadID
+	}
+	if root == "" {
+		return activeTurn{}, false
+	}
+
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	active, ok := m.activeTurns[root]
+	if !ok {
+		active = activeTurn{
+			accountID:    sourceAccountID,
+			lastActivity: m.now(),
+		}
+	}
+	if active.accountID != "" && sourceAccountID != "" && active.accountID != sourceAccountID {
+		return activeTurn{}, false
+	}
+	if active.recovering || active.parked {
+		return activeTurn{}, false
+	}
+	active.accountID = sourceAccountID
+	active.recovering = true
+	active.parked = false
+	active.generation++
+	active.lastActivity = m.now()
+	m.activeTurns[root] = active
+
+	active.params = append(json.RawMessage(nil), active.params...)
+	active.excluded = cloneAccountSet(active.excluded)
+	return active, true
+}
+
+func (m *Multiplexer) setRecoveryFailed(root, sourceAccountID string) {
+	m.activeTurnMu.Lock()
+	if active, ok := m.activeTurns[root]; ok {
+		if sourceAccountID == "" || active.accountID == sourceAccountID {
+			active.recovering = false
+			active.lastActivity = m.now()
+			m.activeTurns[root] = active
+		}
+	}
+	m.activeTurnMu.Unlock()
+}
+
+func (m *Multiplexer) setRecoverySucceeded(
+	root string,
+	targetAccountID string,
+	turnID string,
+	params json.RawMessage,
+	excluded map[string]struct{},
+) {
+	m.activeTurnMu.Lock()
+	active := m.activeTurns[root]
+	active.accountID = targetAccountID
+	if turnID != "" {
+		active.turnID = turnID
+	}
+	active.params = append(json.RawMessage(nil), params...)
+	active.excluded = cloneAccountSet(excluded)
+	active.recovering = false
+	active.parked = false
+	active.lastActivity = m.now()
+	m.activeTurns[root] = active
+	m.activeTurnMu.Unlock()
+}
+
+func (m *Multiplexer) setRecoveryParked(
+	root, sourceAccountID, cause string,
+	failedRaw []byte,
+) bool {
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	active, ok := m.activeTurns[root]
+	if !ok {
+		return false
+	}
+	if active.accountID != sourceAccountID {
+		return false
+	}
+	alreadyParked := active.parked
+	active.recovering = false
+	active.parked = true
+	active.recoveryCause = cause
+	active.failureRaw = append([]byte(nil), failedRaw...)
+	active.lastActivity = m.now()
+	m.activeTurns[root] = active
+	return !alreadyParked
+}
+
+func (m *Multiplexer) claimParkedRecovery(root string) (activeTurn, bool) {
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	active, ok := m.activeTurns[root]
+	if !ok || !active.parked || active.recovering {
+		return activeTurn{}, false
+	}
+	active.parked = false
+	active.recovering = true
+	active.lastActivity = m.now()
+	m.activeTurns[root] = active
+
+	active.params = append(json.RawMessage(nil), active.params...)
+	active.excluded = cloneAccountSet(active.excluded)
+	active.failureRaw = append([]byte(nil), active.failureRaw...)
+	return active, true
+}
+
+func (m *Multiplexer) cancelRecoveryForUser(threadID string) {
+	root := m.rootThreadID(threadID)
+	if root == "" {
+		root = threadID
+	}
+	if root == "" {
+		return
+	}
+
+	tree := m.treeThreadIDs(root)
+	m.activeTurnMu.Lock()
+	for _, id := range tree {
+		delete(m.activeTurns, id)
+	}
+	m.activeTurnMu.Unlock()
+
+	m.commandMu.Lock()
+	for _, id := range tree {
+		delete(m.commandPIDs, id)
+	}
+	m.commandMu.Unlock()
+
+	m.publish(Event{
+		Type:    "thread-recovery-cancelled",
+		Message: "Automatic recovery cancelled by user",
+		Data: map[string]any{
+			"threadId": root,
+		},
+	})
+}
+
+func (m *Multiplexer) cancelParkedRecoveryForUser(threadID string) {
+	root := m.rootThreadID(threadID)
+	if root == "" {
+		root = threadID
+	}
+	if root == "" {
+		return
+	}
+
+	m.activeTurnMu.Lock()
+	active, ok := m.activeTurns[root]
+	if ok && active.parked {
+		delete(m.activeTurns, root)
+	}
+	m.activeTurnMu.Unlock()
+}
+
+func (m *Multiplexer) trackCommandLifecycle(method string, params json.RawMessage) {
+	if method != "item/started" && method != "item/completed" {
+		return
+	}
+
+	var decoded struct {
+		ThreadID string `json:"threadId"`
+		Item     struct {
+			Type      string `json:"type"`
+			ProcessID any    `json:"processId"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(params, &decoded) != nil || decoded.ThreadID == "" {
+		return
+	}
+	if decoded.Item.Type != "commandExecution" {
+		return
+	}
+
+	pid := 0
+	switch value := decoded.Item.ProcessID.(type) {
+	case string:
+		pid, _ = strconv.Atoi(value)
+	case float64:
+		pid = int(value)
+	}
+	if pid <= 1 {
+		return
+	}
+
+	m.commandMu.Lock()
+	defer m.commandMu.Unlock()
+	if method == "item/started" {
+		set := m.commandPIDs[decoded.ThreadID]
+		if set == nil {
+			set = make(map[int]string)
+			m.commandPIDs[decoded.ThreadID] = set
+		}
+		set[pid] = processStartSignature(pid)
+		return
+	}
+	if set := m.commandPIDs[decoded.ThreadID]; set != nil {
+		delete(set, pid)
+		if len(set) == 0 {
+			delete(m.commandPIDs, decoded.ThreadID)
+		}
+	}
+}
+
+func processStartSignature(pid int) string {
+	if pid <= 1 {
+		return ""
+	}
+	output, err := exec.Command(
+		"ps",
+		"-o",
+		"lstart=",
+		"-p",
+		strconv.Itoa(pid),
+	).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func childProcessIDs(pid int) []int {
+	output, err := exec.Command("pgrep", "-P", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return nil
+	}
+	var result []int
+	for _, field := range strings.Fields(string(output)) {
+		child, err := strconv.Atoi(field)
+		if err == nil && child > 1 {
+			result = append(result, child)
+		}
+	}
+	return result
+}
+
+func terminateProcessTree(pid int) {
+	if pid <= 1 {
+		return
+	}
+	for _, child := range childProcessIDs(pid) {
+		terminateProcessTree(child)
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	time.Sleep(150 * time.Millisecond)
+	if syscall.Kill(pid, 0) == nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+}
+
+type trackedCommandProcess struct {
+	pid       int
+	signature string
+}
+
+func (m *Multiplexer) terminateTrackedCommands(root string) {
+	var processes []trackedCommandProcess
+	m.commandMu.Lock()
+	for _, threadID := range m.treeThreadIDs(root) {
+		for pid, signature := range m.commandPIDs[threadID] {
+			processes = append(processes, trackedCommandProcess{
+				pid:       pid,
+				signature: signature,
+			})
+		}
+		delete(m.commandPIDs, threadID)
+	}
+	m.commandMu.Unlock()
+
+	for _, process := range processes {
+		// Avoid killing an unrelated process if macOS recycled a PID after the
+		// command item disappeared without a matching completion notification.
+		if process.signature != "" &&
+			processStartSignature(process.pid) != process.signature {
+			continue
+		}
+		terminateProcessTree(process.pid)
+	}
+}
+
+func (m *Multiplexer) bestEffortInterruptTree(root, sourceAccountID string) {
+	child, ok := m.child(sourceAccountID)
+	if !ok {
+		return
+	}
+
+	type runningTurn struct {
+		threadID string
+		turnID   string
+	}
+	var turns []runningTurn
+	m.activeTurnMu.Lock()
+	for _, threadID := range m.treeThreadIDs(root) {
+		active, exists := m.activeTurns[threadID]
+		if !exists || active.accountID != sourceAccountID || active.turnID == "" {
+			continue
+		}
+		turns = append(turns, runningTurn{threadID: threadID, turnID: active.turnID})
+	}
+	m.activeTurnMu.Unlock()
+
+	for _, turn := range turns {
+		params, _ := json.Marshal(map[string]any{
+			"threadId": turn.threadID,
+			"turnId":   turn.turnID,
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), recoveryInterruptWindow)
+		_, _ = child.Request(ctx, "turn/interrupt", params)
+		cancel()
+	}
+}
+
+func parseCollabItem(params json.RawMessage) (sender string, receivers []string, quotaChild string) {
+	var decoded struct {
+		Item struct {
+			Type              string   `json:"type"`
+			SenderThreadID    string   `json:"senderThreadId"`
+			ReceiverThreadIDs []string `json:"receiverThreadIds"`
+			AgentsStates      map[string]struct {
+				Status  string  `json:"status"`
+				Message *string `json:"message"`
+			} `json:"agentsStates"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(params, &decoded) != nil {
+		return "", nil, ""
+	}
+	if decoded.Item.Type != "collabAgentToolCall" {
+		return "", nil, ""
+	}
+
+	for threadID, agent := range decoded.Item.AgentsStates {
+		if agent.Status != "errored" || agent.Message == nil {
+			continue
+		}
+		if usageLimitText(*agent.Message) {
+			quotaChild = threadID
+			break
+		}
+	}
+	return decoded.Item.SenderThreadID, decoded.Item.ReceiverThreadIDs, quotaChild
+}
+
+func (m *Multiplexer) recordCollabLineage(params json.RawMessage) string {
+	sender, receivers, quotaChild := parseCollabItem(params)
+	if sender != "" && len(receivers) > 0 {
+		m.lineageMu.Lock()
+		for _, receiver := range receivers {
+			if receiver != "" && receiver != sender {
+				if _, exists := m.threadParents[receiver]; !exists {
+					m.threadParents[receiver] = sender
+				}
+			}
+		}
+		m.lineageMu.Unlock()
+	}
+	return quotaChild
+}
+
+func parseErrorNotification(params json.RawMessage) (threadID string, willRetry bool, limited bool) {
+	var decoded struct {
+		ThreadID  string          `json:"threadId"`
+		WillRetry bool            `json:"willRetry"`
+		Error     json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(params, &decoded) != nil {
+		return "", false, false
+	}
+	return decoded.ThreadID, decoded.WillRetry, usageLimitText(string(decoded.Error))
+}
+
+func parseUsageLimitedGoal(params json.RawMessage) string {
+	var decoded struct {
+		ThreadID string `json:"threadId"`
+		Goal     struct {
+			Status string `json:"status"`
+		} `json:"goal"`
+	}
+	if json.Unmarshal(params, &decoded) != nil || decoded.Goal.Status != "usageLimited" {
+		return ""
+	}
+	return decoded.ThreadID
+}
+
+func (m *Multiplexer) clearCompletedThreadTree(threadID, accountID string) {
+	root := m.rootThreadID(threadID)
+	if root == "" {
+		root = threadID
+	}
+
+	if root != threadID {
+		m.clearActiveTurn(threadID, accountID)
+		m.commandMu.Lock()
+		delete(m.commandPIDs, threadID)
+		m.commandMu.Unlock()
+		return
+	}
+
+	tree := m.treeThreadIDs(root)
+	m.activeTurnMu.Lock()
+	for _, id := range tree {
+		active, ok := m.activeTurns[id]
+		if !ok {
+			continue
+		}
+		if accountID == "" || active.accountID == "" || active.accountID == accountID {
+			delete(m.activeTurns, id)
+		}
+	}
+	m.activeTurnMu.Unlock()
+
+	m.commandMu.Lock()
+	for _, id := range tree {
+		delete(m.commandPIDs, id)
+	}
+	m.commandMu.Unlock()
+}
+
+func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool {
+	message := inbound.Message
+	method := message.Method
+
+	if method == "thread/started" {
+		m.recordThreadStarted(inbound.AccountID, message.Params)
+	}
+	if method == "turn/started" {
+		m.recordTurnStarted(inbound.AccountID, message.Params)
+	}
+	m.trackCommandLifecycle(method, message.Params)
+
+	threadID := threadIDFromInboundNotification(method, message.Params)
+	if threadID != "" {
+		m.touchThread(threadID, inbound.AccountID)
+	}
+
+	if method == "item/started" || method == "item/completed" {
+		if quotaChild := m.recordCollabLineage(message.Params); quotaChild != "" {
+			root := m.rootThreadID(quotaChild)
+			if root == "" {
+				root = m.rootThreadID(threadID)
+			}
+			m.markAccountQuotaBlocked(inbound.AccountID)
+			go m.recoverThreadTree(
+				root,
+				inbound.AccountID,
+				"subagent usage limit",
+				append([]byte(nil), inbound.Raw...),
+				true,
+			)
+			return true
+		}
+	}
+
+	if method == "thread/goal/updated" {
+		if limitedThread := parseUsageLimitedGoal(message.Params); limitedThread != "" {
+			m.markAccountQuotaBlocked(inbound.AccountID)
+			go m.recoverThreadTree(
+				m.rootThreadID(limitedThread),
+				inbound.AccountID,
+				"thread goal usage limited",
+				append([]byte(nil), inbound.Raw...),
+				true,
+			)
+			return true
+		}
+	}
+
+	if method == "error" {
+		errorThread, willRetry, limited := parseErrorNotification(message.Params)
+		if limited {
+			m.markAccountQuotaBlocked(inbound.AccountID)
+			if !willRetry && errorThread != "" {
+				go m.recoverThreadTree(
+					m.rootThreadID(errorThread),
+					inbound.AccountID,
+					"terminal usage-limit error",
+					append([]byte(nil), inbound.Raw...),
+					true,
+				)
+				return true
+			}
+		}
+	}
+
+	if method == "turn/completed" {
+		completedThread, explicitLimit := turnCompletedUsageLimit(message.Params)
+		if completedThread == "" {
+			completedThread, _ = silentCompletedTurn(message.Params)
+		}
+		if completedThread != "" {
+			root := m.rootThreadID(completedThread)
+			if root == "" {
+				root = completedThread
+			}
+
+			if explicitLimit {
+				m.markAccountQuotaBlocked(inbound.AccountID)
+				go m.recoverThreadTree(
+					root,
+					inbound.AccountID,
+					"turn completed at usage limit",
+					append([]byte(nil), inbound.Raw...),
+					true,
+				)
+				return true
+			}
+
+			if _, suspicious := silentCompletedTurn(message.Params); suspicious {
+				if _, tracked := m.activeTurnFor(completedThread, inbound.AccountID); tracked {
+					go m.verifySilentCompletionAndRecover(inbound, root)
+					return true
+				}
+			}
+
+			// A terminal notification emitted by the old source while recovery is
+			// in progress must not clear the target's runtime state.
+			if m.threadTreeRecovering(root) {
+				return true
+			}
+
+			m.clearCompletedThreadTree(completedThread, inbound.AccountID)
+		}
+	}
+
+	if m.inboundSourceIsStale(inbound.AccountID, method, message.Params) {
+		return true
+	}
+	return false
+}
+
+func (m *Multiplexer) threadTreeRecovering(root string) bool {
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+	active, ok := m.activeTurns[root]
+	return ok && (active.recovering || active.parked)
+}
+
+func (m *Multiplexer) verifySilentCompletionAndRecover(inbound backend.Inbound, root string) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	snapshot, err := m.accountSnapshotWithProfile(ctx, inbound.AccountID, false)
+	cancel()
+
+	if err == nil && rateLimitsHaveCapacity(snapshot.RateLimits) && !m.accountQuotaBlocked(inbound.AccountID) {
+		threadID := threadIDFromInboundNotification(inbound.Message.Method, inbound.Message.Params)
+		m.clearActiveTurn(threadID, inbound.AccountID)
+		m.writeRaw(inbound.Raw)
+		return
+	}
+
+	if err != nil {
+		// Unknown is not proof of quota exhaustion. Preserve the real terminal
+		// event instead of manufacturing a failover.
+		threadID := threadIDFromInboundNotification(inbound.Message.Method, inbound.Message.Params)
+		m.clearActiveTurn(threadID, inbound.AccountID)
+		m.writeRaw(inbound.Raw)
+		return
+	}
+
+	m.markAccountQuotaBlocked(inbound.AccountID)
+	m.recoverThreadTree(
+		root,
+		inbound.AccountID,
+		"silent completion after quota exhaustion",
+		append([]byte(nil), inbound.Raw...),
+		true,
+	)
+}
+
+func (m *Multiplexer) shouldForwardInbound(inbound backend.Inbound) bool {
+	if m.inboundSourceIsStale(inbound.AccountID, inbound.Message.Method, inbound.Message.Params) {
+		return false
+	}
+	return m.shouldForwardNotification(inbound.AccountID, inbound.Message.Method)
+}
+
+func (m *Multiplexer) recoveryWatchLoop(ctx context.Context) {
+	ticker := time.NewTicker(recoveryWatchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.recoverStalledQuotaTurns()
+		}
+	}
+}
+
+func (m *Multiplexer) recoverStalledQuotaTurns() {
+	now := m.now()
+	type candidate struct {
+		threadID  string
+		accountID string
+	}
+	roots := make(map[string]candidate)
+
+	m.activeTurnMu.Lock()
+	for threadID, active := range m.activeTurns {
+		if active.recovering || active.parked || active.accountID == "" {
+			continue
+		}
+		if active.lastActivity.IsZero() || now.Sub(active.lastActivity) < recoveryStallThreshold {
+			continue
+		}
+		root := m.rootThreadID(threadID)
+		if root == "" {
+			root = threadID
+		}
+		roots[root] = candidate{threadID: root, accountID: active.accountID}
+	}
+	m.activeTurnMu.Unlock()
+
+	for _, entry := range roots {
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		snapshot, err := m.accountSnapshotWithProfile(ctx, entry.accountID, false)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if rateLimitsHaveCapacity(snapshot.RateLimits) && !m.accountQuotaBlocked(entry.accountID) {
+			continue
+		}
+		m.markAccountQuotaBlocked(entry.accountID)
+		go m.recoverThreadTree(
+			entry.threadID,
+			entry.accountID,
+			"stalled turn with exhausted quota",
+			nil,
+			true,
+		)
+	}
+}
+
+func (m *Multiplexer) recoverThreadTree(
+	threadID string,
+	sourceAccountID string,
+	cause string,
+	failedRaw []byte,
+	quota bool,
+) {
+	root := m.rootThreadID(threadID)
+	if root == "" {
+		root = threadID
+	}
+	if root == "" {
+		return
+	}
+
+	active, ok := m.beginRecovery(root, sourceAccountID)
+	if !ok {
+		return
+	}
+
+	if quota {
+		m.markAccountQuotaBlocked(sourceAccountID)
+	}
+	m.markTreeSourceStale(root, sourceAccountID)
+
+	m.bestEffortInterruptTree(root, sourceAccountID)
+	m.terminateTrackedCommands(root)
+	time.Sleep(recoveryFlushDelay)
+
+	excluded := cloneAccountSet(active.excluded)
+	if excluded == nil {
+		excluded = make(map[string]struct{})
+	}
+	if quota {
+		excluded[sourceAccountID] = struct{}{}
+	}
+
+	if err := m.performThreadRecovery(
+		root,
+		sourceAccountID,
+		active,
+		excluded,
+		cause,
+		!quota,
+	); err != nil {
+		if errors.Is(err, errNoSubscriptionCapacity) {
+			if m.setRecoveryParked(root, sourceAccountID, cause, failedRaw) {
+				m.publish(Event{
+					Type:      "thread-recovery-parked",
+					AccountID: sourceAccountID,
+					Message:   "Autonomous task parked until subscription capacity returns",
+					Data: map[string]any{
+						"threadId": root,
+						"cause":    cause,
+					},
+				})
+				go m.waitForParkedRecovery(root)
+			}
+			return
+		}
+
+		m.setRecoveryFailed(root, sourceAccountID)
+		if len(failedRaw) > 0 {
+			m.writeRaw(failedRaw)
+		}
+		m.publish(Event{
+			Type:      "thread-recovery-failed",
+			AccountID: sourceAccountID,
+			Message:   fmt.Sprintf("Could not recover interrupted chat: %v", err),
+			Data: map[string]any{
+				"threadId": root,
+				"cause":    cause,
+			},
+		})
+	}
+}
+
+func (m *Multiplexer) waitForParkedRecovery(root string) {
+	for {
+		ctx := m.runCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+
+		timer := time.NewTimer(recoveryRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		active, ok := m.claimParkedRecovery(root)
+		if !ok {
+			return
+		}
+
+		err := m.performThreadRecovery(
+			root,
+			active.accountID,
+			active,
+			nil,
+			"capacity returned after parked quota failure",
+			true,
+		)
+		if err == nil {
+			return
+		}
+
+		if errors.Is(err, errNoSubscriptionCapacity) {
+			m.activeTurnMu.Lock()
+			current := m.activeTurns[root]
+			current.recovering = false
+			current.parked = true
+			current.lastActivity = m.now()
+			m.activeTurns[root] = current
+			m.activeTurnMu.Unlock()
+			continue
+		}
+
+		m.setRecoveryFailed(root, active.accountID)
+		if len(active.failureRaw) > 0 {
+			m.writeRaw(active.failureRaw)
+		}
+		return
+	}
+}
+
+func (m *Multiplexer) performThreadRecovery(
+	root string,
+	sourceAccountID string,
+	active activeTurn,
+	excluded map[string]struct{},
+	cause string,
+	preferSource bool,
+) error {
+	tried := cloneAccountSet(excluded)
+	if tried == nil {
+		tried = make(map[string]struct{})
+	}
+
+	var candidates []state.Account
+	if preferSource {
+		if source, ok := m.store.Account(sourceAccountID); ok && source.Enabled && !m.accountQuotaBlocked(sourceAccountID) {
+			candidates = append(candidates, source)
+		}
+	}
+
+	for attempts := 0; attempts < len(m.store.Accounts())+2; attempts++ {
+		var target state.Account
+
+		if len(candidates) > 0 {
+			target = candidates[0]
+			candidates = candidates[1:]
+			if _, already := tried[target.ID]; already {
+				continue
+			}
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
+			fallback, _, err := m.chooseAccountExcluding(ctx, tried)
+			cancel()
+			if err != nil {
+				return err
+			}
+			target = fallback
+		}
+
+		if target.ID == "" {
+			continue
+		}
+		tried[target.ID] = struct{}{}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
+		err := m.resumeThreadOnAccount(ctx, root, sourceAccountID, target.ID)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"codex-mux: recover %s: resume %s -> %s failed: %v\n",
+				root,
+				sourceAccountID,
+				target.ID,
+				err,
+			)
+			continue
+		}
+
+		params, err := continuationTurnParams(active.params, root)
+		if err != nil {
+			return err
+		}
+
+		targetChild, ok := m.child(target.ID)
+		if !ok {
+			continue
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), 2*requestTimeout)
+		response, startErr := targetChild.Request(ctx, "turn/start", params)
+		cancel()
+
+		if startErr != nil && strings.Contains(strings.ToLower(startErr.Error()), "active turn") {
+			// One bounded cleanup attempt for a thread that the target still
+			// considers active. Repeated interrupts are intentionally avoided.
+			interruptParams, _ := json.Marshal(map[string]any{
+				"threadId": root,
+				"turnId":   "",
+			})
+			interruptCtx, interruptCancel := context.WithTimeout(
+				context.Background(),
+				recoveryInterruptWindow,
+			)
+			_, _ = targetChild.Request(interruptCtx, "turn/interrupt", interruptParams)
+			interruptCancel()
+
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), 2*requestTimeout)
+			response, startErr = targetChild.Request(retryCtx, "turn/start", params)
+			retryCancel()
+		}
+
+		if startErr != nil {
+			if usageLimitText(startErr.Error()) {
+				m.markAccountQuotaBlocked(target.ID)
+			}
+			fmt.Fprintf(
+				os.Stderr,
+				"codex-mux: recover %s: continuation on %s failed: %v\n",
+				root,
+				target.ID,
+				startErr,
+			)
+			continue
+		}
+
+		turnID := turnIDFromTurnStartResult(response.Result)
+		if err := m.store.SetThreadOwner(root, target.ID); err != nil {
+			return err
+		}
+
+		m.setRecoverySucceeded(root, target.ID, turnID, params, nil)
+		m.clearStaleSource(root, target.ID)
+
+		m.publish(Event{
+			Type:      "thread-autonomous-failed-over",
+			AccountID: target.ID,
+			Message:   fmt.Sprintf("Chat continued with %s", target.Label),
+			Data: map[string]any{
+				"threadId":          root,
+				"previousAccountId": sourceAccountID,
+				"cause":             cause,
+			},
+		})
+
+		fmt.Fprintf(
+			os.Stderr,
+			"codex-mux: recovered thread=%s %s -> %s cause=%q\n",
+			root,
+			sourceAccountID,
+			target.ID,
+			cause,
+		)
+		return nil
+	}
+	return errNoSubscriptionCapacity
+}
+
+func turnIDFromTurnStartResult(result json.RawMessage) string {
+	var decoded struct {
+		Turn struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if json.Unmarshal(result, &decoded) != nil {
+		return ""
+	}
+	return decoded.Turn.ID
+}
+
+func (m *Multiplexer) robustFailoverTurn(
+	message protocol.Message,
+	threadID string,
+	sourceAccountID string,
+	excluded map[string]struct{},
+) {
+	tried := cloneAccountSet(excluded)
+	if tried == nil {
+		tried = make(map[string]struct{})
+	}
+	tried[sourceAccountID] = struct{}{}
+
+	for attempts := 0; attempts < len(m.store.Accounts())+1; attempts++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
+		fallback, _, err := m.chooseAccountExcluding(ctx, tried)
+		cancel()
+		if err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+			m.write(m.allSubscriptionsDepleted(ctx, message.ID))
+			cancel()
+			return
+		}
+
+		tried[fallback.ID] = struct{}{}
+
+		ctx, cancel = context.WithTimeout(context.Background(), 2*requestTimeout)
+		err = m.resumeThreadOnAccount(ctx, threadID, sourceAccountID, fallback.ID)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"codex-mux: interactive resume %s -> %s failed: %v\n",
+				sourceAccountID,
+				fallback.ID,
+				err,
+			)
+			continue
+		}
+
+		if err := m.forwardWithExclusions(fallback.ID, message, nil); err != nil {
+			continue
+		}
+		if err := m.store.SetThreadOwner(threadID, fallback.ID); err != nil {
+			m.write(protocol.Failure(message.ID, -32028, err.Error()))
+			return
+		}
+
+		m.markTreeSourceStale(m.rootThreadID(threadID), sourceAccountID)
+		m.publish(Event{
+			Type:      "thread-failed-over",
+			AccountID: fallback.ID,
+			Message:   fmt.Sprintf("Chat continued with %s", fallback.Label),
+			Data: map[string]any{
+				"threadId":          threadID,
+				"previousAccountId": sourceAccountID,
+			},
+		})
+		return
+	}
+
+	m.write(protocol.Failure(message.ID, -32027, "could not resume chat on any available subscription"))
+}
+
+func (m *Multiplexer) retryTurnAfterUsageLimitRobust(
+	route externalRoute,
+	exhaustedAccountID string,
+) {
+	m.markAccountQuotaBlocked(exhaustedAccountID)
+
+	threadID := threadIDFromParams(route.message.Params)
+	if threadID == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		m.write(m.allSubscriptionsDepleted(ctx, route.message.ID))
+		cancel()
+		return
+	}
+
+	excluded := cloneAccountSet(route.excluded)
+	if excluded == nil {
+		excluded = make(map[string]struct{})
+	}
+	excluded[exhaustedAccountID] = struct{}{}
+	m.robustFailoverTurn(route.message, threadID, exhaustedAccountID, excluded)
+}
+
+func stableReadFile(path string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		before, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		time.Sleep(80 * time.Millisecond)
+		after, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		if before.Size() == after.Size() &&
+			before.ModTime().Equal(after.ModTime()) {
+			return data, nil
+		}
+		lastErr = errors.New("rollout is still being written")
+	}
+	return nil, lastErr
+}
+
+func (m *Multiplexer) findRolloutForThread(accountID, threadID string) string {
+	account, ok := m.store.Account(accountID)
+	if !ok || threadID == "" {
+		return ""
+	}
+	root := filepath.Join(account.CodexHome, "sessions")
+
+	var newestPath string
+	var newestTime time.Time
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".jsonl") || !strings.Contains(name, threadID) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err == nil && (newestPath == "" || info.ModTime().After(newestTime)) {
+			newestPath = path
+			newestTime = info.ModTime()
+		}
+		return nil
+	})
+	return newestPath
+}
+
+func (m *Multiplexer) threadRecoveryData(
+	ctx context.Context,
+	threadID, sourceAccountID string,
+) (threadRecoveryData, error) {
+	var data threadRecoveryData
+
+	if source, ok := m.child(sourceAccountID); ok {
+		params, _ := json.Marshal(map[string]any{
+			"threadId":     threadID,
+			"includeTurns": false,
+		})
+		response, err := source.Request(ctx, "thread/read", params)
+		if err == nil {
+			var decoded struct {
+				Thread struct {
+					ID            string `json:"id"`
+					Path          string `json:"path"`
+					CWD           string `json:"cwd"`
+					ModelProvider string `json:"modelProvider"`
+				} `json:"thread"`
+			}
+			if json.Unmarshal(response.Result, &decoded) == nil && decoded.Thread.ID != "" {
+				data.Path = decoded.Thread.Path
+				data.CWD = decoded.Thread.CWD
+				data.ModelProvider = decoded.Thread.ModelProvider
+			}
+		}
+	}
+
+	if data.Path == "" {
+		data.Path = m.findRolloutForThread(sourceAccountID, threadID)
+	}
+	if data.Path == "" {
+		return data, fmt.Errorf("no rollout found for thread id %s", threadID)
+	}
+	return data, nil
+}
+
+func (m *Multiplexer) mirrorStableRollout(
+	sourcePath, targetAccountID string,
+) (string, error) {
+	targetAccount, ok := m.store.Account(targetAccountID)
+	if !ok {
+		return "", fmt.Errorf("target subscription %q not found", targetAccountID)
+	}
+	sourcePath = filepath.Clean(sourcePath)
+
+	const marker = string(filepath.Separator) + "sessions" + string(filepath.Separator)
+	relative := filepath.Base(sourcePath)
+	if index := strings.LastIndex(sourcePath, marker); index >= 0 {
+		relative = sourcePath[index+len(marker):]
+	}
+	targetPath := filepath.Join(targetAccount.CodexHome, "sessions", relative)
+
+	if sameFilePath(sourcePath, targetPath) {
+		return sourcePath, nil
+	}
+
+	data, err := stableReadFile(sourcePath)
+	if err != nil {
+		return "", fmt.Errorf("read stable source rollout: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
+		return "", err
+	}
+
+	temporary := targetPath + ".codex-mux.tmp"
+	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", err
+	}
+	_, writeErr := file.Write(data)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil {
+		_ = os.Remove(temporary)
+		return "", writeErr
+	}
+	if syncErr != nil {
+		_ = os.Remove(temporary)
+		return "", syncErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(temporary)
+		return "", closeErr
+	}
+	if err := os.Rename(temporary, targetPath); err != nil {
+		_ = os.Remove(temporary)
+		return "", err
+	}
+	if dir, err := os.Open(filepath.Dir(targetPath)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return targetPath, nil
+}
+
+func sameFilePath(left, right string) bool {
+	return filepath.Clean(left) == filepath.Clean(right)
+}
+
+func (m *Multiplexer) verifyResumedThread(
+	ctx context.Context,
+	target *backend.Child,
+	threadID string,
+) error {
+	params, _ := json.Marshal(map[string]any{
+		"threadId":     threadID,
+		"includeTurns": false,
+	})
+	response, err := target.Request(ctx, "thread/read", params)
+	if err != nil {
+		return err
+	}
+	var decoded struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if json.Unmarshal(response.Result, &decoded) != nil || decoded.Thread.ID != threadID {
+		return fmt.Errorf("target did not expose resumed thread %s", threadID)
+	}
+	return nil
+}
+
+func (m *Multiplexer) robustResumeThreadOnAccount(
+	ctx context.Context,
+	threadID, sourceAccountID, targetAccountID string,
+) error {
+	target, ok := m.child(targetAccountID)
+	if !ok {
+		return fmt.Errorf("target subscription is unavailable")
+	}
+
+	// A restarted app-server can normally resume its own thread directly from
+	// its local state database.
+	if sourceAccountID == targetAccountID {
+		params, _ := json.Marshal(map[string]any{"threadId": threadID})
+		resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, resumeErr := target.Request(resumeCtx, "thread/resume", params)
+		resumeCancel()
+		if resumeErr == nil {
+			verifyCtx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+			verifyErr := m.verifyResumedThread(verifyCtx, target, threadID)
+			cancel()
+			return verifyErr
+		}
+	}
+
+	data, err := m.threadRecoveryData(ctx, threadID, sourceAccountID)
+	if err != nil {
+		return err
+	}
+	targetPath, err := m.mirrorStableRollout(data.Path, targetAccountID)
+	if err != nil {
+		return fmt.Errorf("mirror rollout: %w", err)
+	}
+
+	pathParams := map[string]any{
+		"threadId": "",
+		"history":  nil,
+		"path":     targetPath,
+		"model":    nil,
+	}
+	if data.CWD != "" {
+		pathParams["cwd"] = data.CWD
+	}
+	encoded, _ := json.Marshal(pathParams)
+
+	response, pathErr := target.Request(ctx, "thread/resume", encoded)
+	if pathErr == nil {
+		resumedID := threadIDFromResult(response.Result)
+		if resumedID != "" && resumedID != threadID {
+			return fmt.Errorf("path resume returned different thread id %s", resumedID)
+		}
+		verifyCtx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		verifyErr := m.verifyResumedThread(verifyCtx, target, threadID)
+		cancel()
+		if verifyErr == nil {
+			return nil
+		}
+		pathErr = verifyErr
+	}
+
+	// The local path may not yet be indexed in SQLite. Retry by id after the
+	// path attempt because successful path parsing often materializes the
+	// metadata needed by the id resolver.
+	idParams, _ := json.Marshal(map[string]any{"threadId": threadID})
+	if _, idErr := target.Request(ctx, "thread/resume", idParams); idErr == nil {
+		verifyCtx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		verifyErr := m.verifyResumedThread(verifyCtx, target, threadID)
+		cancel()
+		if verifyErr == nil {
+			return nil
+		}
+		return fmt.Errorf("resume verification failed: %w", verifyErr)
+	} else {
+		return fmt.Errorf(
+			"target-local resume failed: path: %v; id: %w",
+			pathErr,
+			idErr,
+		)
+	}
+}
+
+func (m *Multiplexer) handleChildExit(accountID, detail string) {
+	m.childrenMu.Lock()
+	delete(m.children, accountID)
+	m.childrenMu.Unlock()
+
+	var roots []string
+	seen := make(map[string]struct{})
+	m.activeTurnMu.Lock()
+	for threadID, active := range m.activeTurns {
+		if active.accountID != accountID {
+			continue
+		}
+		root := m.rootThreadID(threadID)
+		if root == "" {
+			root = threadID
+		}
+		if _, exists := seen[root]; !exists {
+			seen[root] = struct{}{}
+			roots = append(roots, root)
+		}
+	}
+	m.activeTurnMu.Unlock()
+
+	account, exists := m.store.Account(accountID)
+	if exists && account.Enabled {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
+		if _, err := m.startChild(ctx, account); err != nil {
+			fmt.Fprintf(os.Stderr, "codex-mux: restart account %s failed: %v\n", accountID, err)
+		}
+		cancel()
+	}
+
+	for _, root := range roots {
+		go m.recoverThreadTree(
+			root,
+			accountID,
+			"Codex app-server exited: "+detail,
+			nil,
+			false,
+		)
+	}
+}

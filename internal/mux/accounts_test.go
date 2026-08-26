@@ -39,12 +39,71 @@ func TestLongestAndShortestWindowUsesQuotaDuration(t *testing.T) {
 }
 
 func TestLongestAndShortestWindowHandlesSingleWindow(t *testing.T) {
-	minutes := int64(300)
-	only := &RateLimitWindow{UsedPercent: 12, WindowDurationMins: &minutes}
-	longest, shortest := longestAndShortestWindow(&RateLimits{Primary: only})
-	if longest != only || shortest != only {
-		t.Fatalf("single window should serve both roles: longest=%#v shortest=%#v", longest, shortest)
-	}
+	t.Run("five hour window is short only", func(t *testing.T) {
+		duration := int64(300)
+
+		window := &RateLimitWindow{
+			UsedPercent:        12,
+			WindowDurationMins: &duration,
+		}
+
+		weekly, short := longestAndShortestWindow(&RateLimits{
+			Primary: window,
+		})
+
+		if weekly != nil {
+			t.Fatalf(
+				"single 5h window must not be treated as weekly: %#v",
+				weekly,
+			)
+		}
+
+		if short != window {
+			t.Fatalf(
+				"expected single 5h window as short window: %#v",
+				short,
+			)
+		}
+	})
+
+	t.Run("weekly window is weekly only", func(t *testing.T) {
+		duration := int64(10_080)
+
+		window := &RateLimitWindow{
+			UsedPercent:        12,
+			WindowDurationMins: &duration,
+		}
+
+		weekly, short := longestAndShortestWindow(&RateLimits{
+			Primary: window,
+		})
+
+		if weekly != window {
+			t.Fatalf(
+				"expected single weekly window as weekly window: %#v",
+				weekly,
+			)
+		}
+
+		if short != nil {
+			t.Fatalf(
+				"single weekly window must not be treated as 5h: %#v",
+				short,
+			)
+		}
+	})
+
+	t.Run("empty valid limits have no active windows", func(t *testing.T) {
+		weekly, short := longestAndShortestWindow(&RateLimits{})
+
+		if weekly != nil || short != nil {
+			t.Fatalf(
+				"empty valid rate limits should have no active windows: weekly=%#v short=%#v",
+				weekly,
+				short,
+			)
+		}
+	})
 }
 
 func TestAggregateRateLimitsKeepsPoolAvailable(t *testing.T) {
@@ -149,4 +208,281 @@ func TestRouteUrgencyFallsBackToWeeklyUtilization(t *testing.T) {
 	if lessUsed <= moreUsed {
 		t.Fatalf("fallback should prefer the less-used account: less=%f more=%f", lessUsed, moreUsed)
 	}
+}
+
+func TestRateLimitsHaveCapacityRejectsExhaustedShortWindow(t *testing.T) {
+	shortMinutes := int64(300)
+	weeklyMinutes := int64(10_080)
+
+	limits := &RateLimits{
+		Primary: &RateLimitWindow{
+			UsedPercent:        100,
+			WindowDurationMins: &shortMinutes,
+		},
+		Secondary: &RateLimitWindow{
+			UsedPercent:        16,
+			WindowDurationMins: &weeklyMinutes,
+		},
+		RateLimitReachedType: "rate_limit_reached",
+	}
+
+	if rateLimitsHaveCapacity(limits) {
+		t.Fatal("account with exhausted 5-hour window must not have capacity")
+	}
+}
+
+func TestRateLimitsHaveCapacityAllowsSingleWeeklyWindow(t *testing.T) {
+	weeklyMinutes := int64(10_080)
+
+	limits := &RateLimits{
+		Primary: &RateLimitWindow{
+			UsedPercent:        0,
+			WindowDurationMins: &weeklyMinutes,
+		},
+		Secondary:            nil,
+		RateLimitReachedType: nil,
+	}
+
+	if !rateLimitsHaveCapacity(limits) {
+		t.Fatal("unused account with only a weekly window should have capacity")
+	}
+}
+
+func TestAggregateRateLimitsTreatsShortWindowAsCapacityLimit(t *testing.T) {
+	shortMinutes := int64(300)
+	weeklyMinutes := int64(10_080)
+
+	makeExhausted := func(id string) AccountSnapshot {
+		return AccountSnapshot{
+			ID:        id,
+			Enabled:   true,
+			Connected: true,
+			AuthType:  "chatgpt",
+			RateLimits: &RateLimits{
+				Primary: &RateLimitWindow{
+					UsedPercent:        100,
+					WindowDurationMins: &shortMinutes,
+				},
+				Secondary: &RateLimitWindow{
+					UsedPercent:        16,
+					WindowDurationMins: &weeklyMinutes,
+				},
+				RateLimitReachedType: "rate_limit_reached",
+			},
+		}
+	}
+
+	limits, err := aggregateRateLimits([]AccountSnapshot{
+		makeExhausted("one"),
+		makeExhausted("two"),
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if limits.RateLimitReachedType != "rate_limit_reached" {
+		t.Fatalf(
+			"pool with every short window exhausted must report depletion: %#v",
+			limits,
+		)
+	}
+}
+
+func TestAggregateRateLimitsNormalizesMixedWindowPositions(t *testing.T) {
+	short := int64(300)
+	weekly := int64(10_080)
+
+	snapshots := []AccountSnapshot{
+		{
+			ID:        "primary",
+			Enabled:   true,
+			Connected: true,
+			AuthType:  "chatgpt",
+			RateLimits: &RateLimits{
+				Primary: &RateLimitWindow{
+					UsedPercent:        100,
+					WindowDurationMins: &short,
+				},
+				Secondary: &RateLimitWindow{
+					UsedPercent:        16,
+					WindowDurationMins: &weekly,
+				},
+				RateLimitReachedType: "rate_limit_reached",
+			},
+		},
+		{
+			ID:        "subscription-2",
+			Enabled:   true,
+			Connected: true,
+			AuthType:  "chatgpt",
+			RateLimits: &RateLimits{
+				Primary: &RateLimitWindow{
+					UsedPercent:        100,
+					WindowDurationMins: &short,
+				},
+				Secondary: &RateLimitWindow{
+					UsedPercent:        16,
+					WindowDurationMins: &weekly,
+				},
+				RateLimitReachedType: "rate_limit_reached",
+			},
+		},
+		{
+			ID:        "subscription-3",
+			Enabled:   true,
+			Connected: true,
+			AuthType:  "chatgpt",
+			RateLimits: &RateLimits{
+				// Untouched account currently exposes only its weekly
+				// window, and exposes it as primary.
+				Primary: &RateLimitWindow{
+					UsedPercent:        0,
+					WindowDurationMins: &weekly,
+				},
+				Secondary:            nil,
+				RateLimitReachedType: nil,
+			},
+		},
+	}
+
+	got, err := aggregateRateLimits(snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Primary == nil ||
+		got.Primary.WindowDurationMins == nil ||
+		*got.Primary.WindowDurationMins != short {
+		t.Fatalf("expected normalized 5h primary window, got %#v", got.Primary)
+	}
+
+	if diff := got.Primary.UsedPercent - (200.0 / 3.0); diff < -0.001 || diff > 0.001 {
+		t.Fatalf(
+			"expected pooled 5h usage ~= 66.67%%, got %.4f",
+			got.Primary.UsedPercent,
+		)
+	}
+
+	if got.Secondary == nil ||
+		got.Secondary.WindowDurationMins == nil ||
+		*got.Secondary.WindowDurationMins != weekly {
+		t.Fatalf(
+			"expected normalized weekly secondary window, got %#v",
+			got.Secondary,
+		)
+	}
+
+	if diff := got.Secondary.UsedPercent - (32.0 / 3.0); diff < -0.001 || diff > 0.001 {
+		t.Fatalf(
+			"expected pooled weekly usage ~= 10.67%%, got %.4f",
+			got.Secondary.UsedPercent,
+		)
+	}
+
+	if got.RateLimitReachedType != nil {
+		t.Fatalf(
+			"pool must not be depleted while subscription 3 has capacity: %#v",
+			got.RateLimitReachedType,
+		)
+	}
+}
+
+func TestTurnCompletedUsageLimit(t *testing.T) {
+	t.Run("structured usage limit", func(t *testing.T) {
+		threadID, limited := turnCompletedUsageLimit([]byte(`{
+			"threadId":"thread-1",
+			"turn":{
+				"status":"failed",
+				"error":{
+					"message":"usage exhausted",
+					"codexErrorInfo":"usageLimitExceeded"
+				}
+			}
+		}`))
+
+		if threadID != "thread-1" {
+			t.Fatalf("unexpected thread id: %q", threadID)
+		}
+
+		if !limited {
+			t.Fatal("expected usage-limit failure")
+		}
+	})
+
+	t.Run("ordinary completed turn", func(t *testing.T) {
+		threadID, limited := turnCompletedUsageLimit([]byte(`{
+			"threadId":"thread-2",
+			"turn":{
+				"status":"completed",
+				"error":null
+			}
+		}`))
+
+		if threadID != "thread-2" {
+			t.Fatalf("unexpected thread id: %q", threadID)
+		}
+
+		if limited {
+			t.Fatal("completed turn must not be classified as usage limited")
+		}
+	})
+
+	t.Run("non quota failure", func(t *testing.T) {
+		_, limited := turnCompletedUsageLimit([]byte(`{
+			"threadId":"thread-3",
+			"turn":{
+				"status":"failed",
+				"error":{
+					"message":"sandbox failed",
+					"codexErrorInfo":"sandboxError"
+				}
+			}
+		}`))
+
+		if limited {
+			t.Fatal("sandbox failure must not trigger subscription failover")
+		}
+	})
+}
+
+func TestSilentCompletedTurn(t *testing.T) {
+	t.Run("empty completed turn is suspicious", func(t *testing.T) {
+		threadID, silent := silentCompletedTurn([]byte(`{
+			"threadId":"thread-1",
+			"turn":{
+				"id":"turn-1",
+				"status":"completed",
+				"items":[]
+			}
+		}`))
+
+		if threadID != "thread-1" {
+			t.Fatalf("unexpected thread id: %q", threadID)
+		}
+
+		if !silent {
+			t.Fatal("expected empty completed turn to be suspicious")
+		}
+	})
+
+	t.Run("agent message means normal completion", func(t *testing.T) {
+		_, silent := silentCompletedTurn([]byte(`{
+			"threadId":"thread-2",
+			"turn":{
+				"id":"turn-2",
+				"status":"completed",
+				"items":[
+					{
+						"type":"agentMessage",
+						"text":"Finished successfully."
+					}
+				]
+			}
+		}`))
+
+		if silent {
+			t.Fatal("normal agent completion must not be suspicious")
+		}
+	})
 }

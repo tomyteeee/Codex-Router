@@ -18,9 +18,11 @@ import (
 )
 
 type Inbound struct {
-	AccountID string
-	Message   protocol.Message
-	Raw       []byte
+	AccountID  string
+	Message    protocol.Message
+	Raw        []byte
+	Exited     bool
+	ExitDetail string
 }
 
 type response struct {
@@ -42,6 +44,7 @@ type Child struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan response
 	sequence  atomic.Uint64
+	closing   atomic.Bool
 	closed    chan struct{}
 	closeOnce sync.Once
 }
@@ -137,6 +140,7 @@ func (c *Child) Request(ctx context.Context, method string, params json.RawMessa
 }
 
 func (c *Child) Close() error {
+	c.closing.Store(true)
 	if c.command.Process == nil {
 		return nil
 	}
@@ -176,11 +180,43 @@ func (c *Child) readLoop(stdout io.Reader) {
 func (c *Child) waitLoop() {
 	err := c.command.Wait()
 	c.closeOnce.Do(func() { close(c.closed) })
+
+	exitErr := err
+	if exitErr == nil {
+		exitErr = errors.New("Codex app-server exited")
+	} else {
+		exitErr = fmt.Errorf("Codex app-server exited: %w", exitErr)
+	}
+
 	c.pendingMu.Lock()
-	defer c.pendingMu.Unlock()
 	for key, responses := range c.pending {
-		responses <- response{err: fmt.Errorf("Codex app-server exited: %w", err)}
+		responses <- response{err: exitErr}
 		delete(c.pending, key)
+	}
+	c.pendingMu.Unlock()
+
+	if c.closing.Load() {
+		return
+	}
+
+	detail := "process exited"
+	if err != nil {
+		detail = err.Error()
+	}
+
+	select {
+	case c.inbound <- Inbound{
+		AccountID:  c.accountID,
+		Exited:     true,
+		ExitDetail: detail,
+	}:
+	default:
+		fmt.Fprintf(
+			os.Stderr,
+			"codex-mux: could not report %s app-server exit: %s\n",
+			c.accountID,
+			detail,
+		)
 	}
 }
 

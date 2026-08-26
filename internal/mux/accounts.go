@@ -254,6 +254,9 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 		if _, skip := excluded[snapshot.ID]; skip {
 			continue
 		}
+		if m.accountQuotaBlocked(snapshot.ID) {
+			continue
+		}
 		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
 			continue
 		}
@@ -261,12 +264,25 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 		if !ok {
 			continue
 		}
-		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly != nil && weekly.UsedPercent >= 100 {
+		if snapshot.RateLimits == nil {
 			continue
 		}
-		weeklyUsed := 1_000.0
-		shortUsed := 1_000.0
+		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
+		if !rateLimitsHaveCapacity(snapshot.RateLimits) {
+			continue
+		}
+		// Completely untouched subscription.
+		// Valid rate-limit state with no active windows means 0% usage.
+		if weekly == nil && short == nil {
+			weeklyMinutes := int64(10080)
+			weekly = &RateLimitWindow{
+				UsedPercent:        0,
+				WindowDurationMins: &weeklyMinutes,
+			}
+		}
+
+		weeklyUsed := 0.0
+		shortUsed := 0.0
 		reason := RouteReason{ThreadCount: snapshot.ThreadCount}
 		if weekly != nil {
 			weeklyUsed = weekly.UsedPercent
@@ -385,35 +401,171 @@ func (m *Multiplexer) AggregatedRateLimits(ctx context.Context) (*RateLimits, er
 }
 
 func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
-	primary := make([]*RateLimitWindow, 0, len(snapshots))
-	secondary := make([]*RateLimitWindow, 0, len(snapshots))
+	eligible := make([]AccountSnapshot, 0, len(snapshots))
+	durationSet := make(map[int64]struct{})
+
 	hasSubscription := false
 	hasCapacity := false
+
 	for _, snapshot := range snapshots {
-		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
+		if !snapshot.Enabled ||
+			!snapshot.Connected ||
+			snapshot.AuthType != "chatgpt" {
 			continue
 		}
+
 		hasSubscription = true
-		if snapshot.RateLimits != nil {
-			primary = append(primary, snapshot.RateLimits.Primary)
-			secondary = append(secondary, snapshot.RateLimits.Secondary)
-		}
-		weekly, _ := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly == nil || weekly.UsedPercent < 100 {
+		eligible = append(eligible, snapshot)
+
+		if rateLimitsHaveCapacity(snapshot.RateLimits) {
 			hasCapacity = true
 		}
+
+		if snapshot.RateLimits == nil {
+			continue
+		}
+
+		for _, window := range []*RateLimitWindow{
+			snapshot.RateLimits.Primary,
+			snapshot.RateLimits.Secondary,
+		} {
+			if window == nil ||
+				window.WindowDurationMins == nil ||
+				*window.WindowDurationMins <= 0 {
+				continue
+			}
+
+			durationSet[*window.WindowDurationMins] = struct{}{}
+		}
 	}
+
 	if !hasSubscription {
-		return nil, errors.New("no enabled ChatGPT subscription is connected")
+		return nil, errors.New(
+			"no enabled ChatGPT subscription is connected",
+		)
 	}
-	result := &RateLimits{
-		Primary:   averageRateLimitWindow(primary),
-		Secondary: averageRateLimitWindow(secondary),
+
+	durations := make([]int64, 0, len(durationSet))
+	for duration := range durationSet {
+		durations = append(durations, duration)
 	}
+
+	sort.Slice(durations, func(i, j int) bool {
+		return durations[i] < durations[j]
+	})
+
+	// RateLimits only exposes primary/secondary slots. Treat those as
+	// transport slots and normalize their meaning by actual duration.
+	//
+	// If future Codex versions expose >2 core durations, preserve the
+	// shortest and longest until the protocol model is expanded.
+	if len(durations) > 2 {
+		durations = []int64{
+			durations[0],
+			durations[len(durations)-1],
+		}
+	}
+
+	pooled := make([]*RateLimitWindow, 0, len(durations))
+
+	for _, duration := range durations {
+		contributors := make(
+			[]*RateLimitWindow,
+			0,
+			len(eligible),
+		)
+
+		for _, snapshot := range eligible {
+			// nil means we failed to obtain usage state.
+			// Do not pretend unknown state means 0%.
+			if snapshot.RateLimits == nil {
+				continue
+			}
+
+			var found *RateLimitWindow
+
+			for _, window := range []*RateLimitWindow{
+				snapshot.RateLimits.Primary,
+				snapshot.RateLimits.Secondary,
+			} {
+				if window == nil ||
+					window.WindowDurationMins == nil {
+					continue
+				}
+
+				if *window.WindowDurationMins == duration {
+					found = window
+					break
+				}
+			}
+
+			if found != nil {
+				contributors = append(contributors, found)
+				continue
+			}
+
+			// Valid usage state with this window omitted:
+			// the window is not currently active, so usage is 0%.
+			durationCopy := duration
+
+			contributors = append(
+				contributors,
+				&RateLimitWindow{
+					UsedPercent:        0,
+					WindowDurationMins: &durationCopy,
+					ResetsAt:           nil,
+				},
+			)
+		}
+
+		if averaged := averageRateLimitWindow(contributors); averaged != nil {
+			pooled = append(pooled, averaged)
+		}
+	}
+
+	result := &RateLimits{}
+
+	if len(pooled) >= 1 {
+		result.Primary = pooled[0]
+	}
+
+	if len(pooled) >= 2 {
+		result.Secondary = pooled[1]
+	}
+
 	if !hasCapacity {
 		result.RateLimitReachedType = "rate_limit_reached"
 	}
+
 	return result, nil
+}
+
+func rateLimitWindows(limits *RateLimits) []*RateLimitWindow {
+	if limits == nil {
+		return nil
+	}
+
+	return []*RateLimitWindow{
+		limits.Primary,
+		limits.Secondary,
+	}
+}
+
+func rateLimitWindowByDuration(
+	limits *RateLimits,
+	durationMins int64,
+) *RateLimitWindow {
+	for _, window := range rateLimitWindows(limits) {
+		if window == nil || window.WindowDurationMins == nil {
+			continue
+		}
+
+		if *window.WindowDurationMins == durationMins {
+			return window
+		}
+	}
+
+	return nil
 }
 
 func averageRateLimitWindow(windows []*RateLimitWindow) *RateLimitWindow {
@@ -447,23 +599,58 @@ func averageRateLimitWindow(windows []*RateLimitWindow) *RateLimitWindow {
 	}
 }
 
-func longestAndShortestWindow(limits *RateLimits) (*RateLimitWindow, *RateLimitWindow) {
+func rateLimitsHaveCapacity(limits *RateLimits) bool {
+	if limits == nil {
+		return false
+	}
+
+	for _, window := range []*RateLimitWindow{
+		limits.Primary,
+		limits.Secondary,
+	} {
+		if window != nil && window.UsedPercent >= 100 {
+			return false
+		}
+	}
+
+	return limits.RateLimitReachedType == nil
+}
+
+func longestAndShortestWindow(
+	limits *RateLimits,
+) (*RateLimitWindow, *RateLimitWindow) {
 	if limits == nil {
 		return nil, nil
 	}
+
 	windows := make([]*RateLimitWindow, 0, 2)
+
 	if limits.Primary != nil {
 		windows = append(windows, limits.Primary)
 	}
+
 	if limits.Secondary != nil {
 		windows = append(windows, limits.Secondary)
 	}
+
 	if len(windows) == 0 {
 		return nil, nil
 	}
+
 	sort.SliceStable(windows, func(i, j int) bool {
 		return duration(windows[i]) < duration(windows[j])
 	})
+
+	if len(windows) == 1 {
+		// 300 minutes is the active five-hour window.
+		// A lone 10080-minute window is weekly-only.
+		if duration(windows[0]) == 300 {
+			return nil, windows[0]
+		}
+
+		return windows[0], nil
+	}
+
 	return windows[len(windows)-1], windows[0]
 }
 

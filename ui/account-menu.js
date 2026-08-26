@@ -23,6 +23,163 @@ async function codexMuxRequest(path, options = {}) {
   return body;
 }
 
+
+async function codexMuxPooledUsageStatus(nativeStatus) {
+  try {
+    const result = await codexMuxRequest("/accounts");
+
+    const accounts = Array.isArray(result?.accounts)
+      ? result.accounts.filter(
+          (account) =>
+            account?.enabled &&
+            account?.connected &&
+            account?.authType === "chatgpt",
+        )
+      : [];
+
+    if (accounts.length === 0) {
+      return nativeStatus;
+    }
+
+    function accountHasCapacity(account) {
+      const limits = account?.rateLimits;
+
+      // Unknown quota state is not assumed usable.
+      if (!limits) {
+        return false;
+      }
+
+      for (const window of [limits.primary, limits.secondary]) {
+        if (
+          window != null &&
+          Number.isFinite(Number(window.usedPercent)) &&
+          Number(window.usedPercent) >= 100
+        ) {
+          return false;
+        }
+      }
+
+      return limits.rateLimitReachedType == null;
+    }
+
+    const hasCapacity = accounts.some(accountHasCapacity);
+
+    // Only accounts with a successful rate-limit read participate in
+    // percentage aggregation. A valid empty object is still meaningful:
+    // it represents an untouched subscription.
+    const knownAccounts = accounts.filter(
+      (account) => account?.rateLimits != null,
+    );
+
+    const windowsByAccount = knownAccounts.map((account) => {
+      const byDuration = new Map();
+
+      for (const window of [
+        account.rateLimits.primary,
+        account.rateLimits.secondary,
+      ]) {
+        if (!window) continue;
+
+        const minutes = Number(window.windowDurationMins);
+
+        if (!Number.isFinite(minutes) || minutes <= 0) {
+          continue;
+        }
+
+        byDuration.set(minutes, window);
+      }
+
+      return byDuration;
+    });
+
+    // primary/secondary are transport positions, not semantic identities.
+    const durations = [
+      ...new Set(
+        windowsByAccount.flatMap((windows) => [...windows.keys()]),
+      ),
+    ].sort((a, b) => a - b);
+
+    const selectedDurations =
+      durations.length <= 2
+        ? durations
+        : [durations[0], durations[durations.length - 1]];
+
+    function pooledWindow(minutes) {
+      if (knownAccounts.length === 0) {
+        return null;
+      }
+
+      const contributors = knownAccounts.map((account, index) => {
+        const actual = windowsByAccount[index].get(minutes);
+
+        if (actual) {
+          return actual;
+        }
+
+        // The account has valid usage state but this duration is absent.
+        // That means this particular window has not commenced/is inactive.
+        return {
+          usedPercent: 0,
+          resetsAt: null,
+        };
+      });
+
+      const usedPercent =
+        contributors.reduce(
+          (total, window) =>
+            total +
+            Math.max(
+              0,
+              Math.min(100, Number(window.usedPercent) || 0),
+            ),
+          0,
+        ) / contributors.length;
+
+      const resets = contributors
+        .map((window) => Number(window.resetsAt))
+        .filter(Number.isFinite);
+
+      return {
+        used_percent: usedPercent,
+        limit_window_seconds: minutes * 60,
+        reset_at: resets.length ? Math.min(...resets) : null,
+      };
+    }
+
+    const pooledWindows = selectedDurations
+      .map(pooledWindow)
+      .filter(Boolean);
+
+    const rateLimit = {
+      ...(nativeStatus?.rate_limit || {}),
+      allowed: hasCapacity,
+      limit_reached: !hasCapacity,
+      primary_window: pooledWindows[0] || null,
+      secondary_window: pooledWindows[1] || null,
+    };
+
+    if (hasCapacity) {
+      return {
+        ...nativeStatus,
+        rate_limit_reached_type: null,
+        rate_limit_upsell: undefined,
+        rate_limit: rateLimit,
+      };
+    }
+
+    return {
+      ...nativeStatus,
+      rate_limit_reached_type:
+        nativeStatus?.rate_limit_reached_type ??
+        { type: "rate_limit_reached" },
+      rate_limit: rateLimit,
+    };
+  } catch {
+    return nativeStatus;
+  }
+}
+
+
 const CODEX_MUX_ACCOUNT_SCOPED_PLUGIN_METHODS = new Set([
   "app/list",
   "app/installed",

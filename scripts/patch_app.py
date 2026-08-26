@@ -1076,19 +1076,33 @@ def patch_renderer(extracted: Path, token: str) -> None:
             1,
         )
 
-    depleted_alert_anchors = (
-        "defaultMessage:`You’re out of Codex and Work usage`",
-        "defaultMessage:`You’ve used all Codex and Work usage`",
-        "defaultMessage:`You’ve reached your usage limit`",
+    # Keep ChatGPT's native per-account rate-limit messages unchanged.
+    # The multiplexer itself reports pool-wide depletion only when no
+    # connected subscription has remaining capacity.
+    # ChatGPT 26.818 obtains the native usage/depletion banner from
+    # /wham/usage rather than account/rateLimits/read. Adapt that response
+    # to the connected subscription pool before React stores it.
+    wham_usage_anchor = (
+        "r={...e,rate_limit_upsell:n.success?"
+        "n.data.rate_limit_upsell:void 0};"
+        "return dSr(t,r),r"
     )
-    for depleted_anchor in depleted_alert_anchors:
-        if bundle.count(depleted_anchor) != 1:
-            raise RuntimeError("could not find a native subscription depletion alert")
-        bundle = bundle.replace(
-            depleted_anchor,
-            "defaultMessage:`All connected subscriptions are depleted`",
-            1,
+    if bundle.count(wham_usage_anchor) != 1:
+        raise RuntimeError(
+            "could not find the ChatGPT 26.818 /wham/usage result anchor"
         )
+
+    bundle = bundle.replace(
+        wham_usage_anchor,
+        (
+            "r={...e,rate_limit_upsell:n.success?"
+            "n.data.rate_limit_upsell:void 0};"
+            "r=await codexMuxPooledUsageStatus(r);"
+            "return dSr(t,r),r"
+        ),
+        1,
+    )
+
     bundle_path.write_text(bundle, encoding="utf-8")
 
     profile_bundles = list((webview / "assets").glob("profile-*.js"))
