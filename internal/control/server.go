@@ -217,6 +217,15 @@ func (s *Server) accountAction(response http.ResponseWriter, request *http.Reque
 		writeJSON(response, http.StatusOK, map[string]any{"account": account})
 		return
 	}
+	if len(parts) == 2 && parts[1] == "usage" && request.Method == http.MethodGet {
+		result, err := s.mux.AccountUsage(ctx, accountID)
+		if err != nil {
+			writeJSON(response, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+		writeRawJSON(response, http.StatusOK, result)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "rate-limit-resets" && request.Method == http.MethodGet {
 		result, err := s.mux.RateLimitResetCredits(ctx, accountID)
 		if err != nil {

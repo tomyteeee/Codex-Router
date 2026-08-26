@@ -1,16 +1,17 @@
 const CODEX_MUX_THREAD_API = "http://127.0.0.1:__CODEX_MUX_CONTROL_PORT__/v1";
 const CODEX_MUX_THREAD_TOKEN = "__CODEX_MUX_CONTROL_TOKEN__";
 
-function CodexMuxThreadSubscription() {
-  const route = $n(sr);
-  const threadId =
-    route.value.routeKind === "local-thread" ? route.value.conversationId : null;
-  const [account, setAccount] = TE.useState(null);
+function CodexMuxThreadSubscription({ threadId }) {
+  const React = globalThis.CodexMuxGetReact();
 
-  TE.useEffect(() => {
+  const [account, setAccount] = React.useState(null);
+
+  React.useEffect(() => {
     let active = true;
+
     if (!threadId) {
       setAccount(null);
+
       return () => {
         active = false;
       };
@@ -20,34 +21,54 @@ function CodexMuxThreadSubscription() {
       try {
         const response = await fetch(
           `${CODEX_MUX_THREAD_API}/thread-account?threadId=${encodeURIComponent(threadId)}`,
-          { headers: { "X-Codex-Mux-Token": CODEX_MUX_THREAD_TOKEN } },
+          {
+            headers: {
+              "X-Codex-Mux-Token": CODEX_MUX_THREAD_TOKEN,
+            },
+          },
         );
-        if (!response.ok) throw new Error(`Request failed (${response.status})`);
+
+        if (!response.ok) {
+          throw new Error(`Request failed (${response.status})`);
+        }
+
         const body = await response.json();
-        if (active) setAccount(body.account || null);
+
+        if (active) {
+          setAccount(body.account || null);
+        }
       } catch {
-        if (active) setAccount(null);
+        if (active) {
+          setAccount(null);
+        }
       }
     };
 
     refresh();
+
     const events = new EventSource(
       `${CODEX_MUX_THREAD_API}/events?token=${encodeURIComponent(CODEX_MUX_THREAD_TOKEN)}`,
     );
+
     events.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data);
+
         if (
           payload.type === "account-updated" ||
           (payload.type === "thread-failed-over" &&
+            payload.data?.threadId === threadId) ||
+          (payload.type === "thread-autonomous-failed-over" &&
             payload.data?.threadId === threadId)
         ) {
           refresh();
         }
       } catch {}
     };
+
     const warmupTimer = setTimeout(refresh, 2_000);
     const timer = setInterval(refresh, 30_000);
+
     return () => {
       active = false;
       clearTimeout(warmupTimer);
@@ -56,54 +77,78 @@ function CodexMuxThreadSubscription() {
     };
   }, [threadId]);
 
-  if (!account) return null;
+  if (!account) {
+    return null;
+  }
+
   const weekly = codexMuxThreadWeeklyWindow(account.rateLimits);
-  const remaining = weekly == null ? null : Math.max(0, 100 - weekly.usedPercent);
+
+  const remaining =
+    weekly == null
+      ? null
+      : Math.max(0, 100 - Number(weekly.usedPercent || 0));
+
   const depleted = remaining === 0;
   const AccountAvatar = globalThis.CodexMuxAccountAvatar;
-  return (0, zE.jsx)(K.Section, {
-    sectionKey: "codex-mux-subscription",
-    title: "Subscription",
-    children: (0, zE.jsxs)("div", {
-      className: "flex min-h-9 items-center justify-between gap-3 py-1 text-sm",
-      children: [
-        (0, zE.jsxs)("div", {
-          className: "flex min-w-0 items-center gap-2",
-          children: [
-            AccountAvatar
-              ? (0, zE.jsx)(AccountAvatar, {
-                  imageUrl: account.profileImageUrl,
-                  label: account.label,
-                  className: "size-5 shrink-0",
-                })
-              : null,
-            (0, zE.jsx)("span", {
-              className: "truncate text-token-text-primary",
-              children: account.planLabel
-                ? `${account.label} · ${account.planLabel}`
-                : account.label,
-            }),
-          ],
-        }),
-        (0, zE.jsx)("span", {
-          className: "shrink-0 tabular-nums text-token-description-foreground",
-          children:
-            remaining == null
-              ? "Usage unavailable"
-              : depleted
-                ? "Depleted"
-                : `${Math.round(remaining)}% remaining`,
-        }),
-      ],
-    }),
-  });
+
+  return (0, __CODEX_MUX_THREAD_JSX__.jsx)(
+    __CODEX_MUX_THREAD_SECTION__.Section,
+    {
+      sectionKey: "codex-mux-subscription",
+      title: "Subscription",
+      children: (0, __CODEX_MUX_THREAD_JSX__.jsxs)("div", {
+        className:
+          "flex min-h-9 items-center justify-between gap-3 py-1 text-sm",
+        children: [
+          (0, __CODEX_MUX_THREAD_JSX__.jsxs)("div", {
+            className: "flex min-w-0 items-center gap-2",
+            children: [
+              AccountAvatar
+                ? (0, __CODEX_MUX_THREAD_JSX__.jsx)(AccountAvatar, {
+                    imageUrl: account.profileImageUrl,
+                    label: account.label,
+                    className: "size-5 shrink-0",
+                  })
+                : null,
+              (0, __CODEX_MUX_THREAD_JSX__.jsx)("span", {
+                className: "truncate text-token-text-primary",
+                children: account.planLabel
+                  ? `${account.label} · ${account.planLabel}`
+                  : account.label,
+              }),
+            ],
+          }),
+          (0, __CODEX_MUX_THREAD_JSX__.jsx)("span", {
+            className:
+              "shrink-0 tabular-nums text-token-description-foreground",
+            children:
+              remaining == null
+                ? "Usage unavailable"
+                : depleted
+                  ? "Depleted"
+                  : `${Math.round(remaining)}% remaining`,
+          }),
+        ],
+      }),
+    },
+  );
 }
 
 function codexMuxThreadWeeklyWindow(rateLimits) {
-  const windows = [rateLimits?.primary, rateLimits?.secondary].filter(Boolean);
+  const windows = [
+    rateLimits?.primary,
+    rateLimits?.secondary,
+  ].filter(Boolean);
+
   windows.sort(
     (left, right) =>
-      (left.windowDurationMins || 0) - (right.windowDurationMins || 0),
+      Number(left.windowDurationMins || 0) -
+      Number(right.windowDurationMins || 0),
   );
-  return windows.at(-1) || null;
+
+  const weekly = windows.find(
+    (window) => Number(window.windowDurationMins) === 10080,
+  );
+
+  return weekly || null;
 }

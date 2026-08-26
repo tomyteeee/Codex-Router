@@ -50,6 +50,193 @@ type activeTurn struct {
 	failureRaw    []byte
 }
 
+type quotaBucket string
+
+const (
+	quotaBucketNormal  quotaBucket = "codex"
+	quotaBucketReserve quotaBucket = "gpt-reserve"
+)
+
+func quotaBucketOverrideFromParams(
+	params json.RawMessage,
+) (quotaBucket, bool) {
+	var decoded map[string]json.RawMessage
+
+	if json.Unmarshal(params, &decoded) != nil {
+		return quotaBucketNormal, false
+	}
+
+	rawModel, ok := decoded["model"]
+	if !ok || len(rawModel) == 0 || string(rawModel) == "null" {
+		return quotaBucketNormal, false
+	}
+
+	var model string
+	if json.Unmarshal(rawModel, &model) != nil {
+		return quotaBucketNormal, false
+	}
+
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return quotaBucketNormal, false
+	}
+
+	if strings.EqualFold(model, "gpt-reserve") {
+		return quotaBucketReserve, true
+	}
+
+	return quotaBucketNormal, true
+}
+
+func quotaBucketFromParams(params json.RawMessage) quotaBucket {
+	bucket, ok := quotaBucketOverrideFromParams(params)
+	if !ok {
+		return quotaBucketNormal
+	}
+	return bucket
+}
+
+func reserveRateLimitsFromMap(
+	byLimitID map[string]*RateLimits,
+) *RateLimits {
+	for limitID, limits := range byLimitID {
+		if limits == nil {
+			continue
+		}
+
+		name := ""
+		if limits.LimitName != nil {
+			name = strings.TrimSpace(*limits.LimitName)
+		}
+
+		id := ""
+		if limits.LimitID != nil {
+			id = strings.TrimSpace(*limits.LimitID)
+		}
+
+		if strings.EqualFold(name, "gpt-reserve") ||
+			strings.EqualFold(id, "gpt-reserve") ||
+			strings.EqualFold(limitID, "gpt-reserve") {
+			return limits
+		}
+	}
+
+	return nil
+}
+
+func rateLimitsForQuotaBucket(
+	snapshot AccountSnapshot,
+	bucket quotaBucket,
+) *RateLimits {
+	if bucket == quotaBucketReserve {
+		return reserveRateLimitsFromMap(
+			snapshot.RateLimitsByLimitID,
+		)
+	}
+
+	return snapshot.RateLimits
+}
+
+func quotaBlockKey(
+	accountID string,
+	bucket quotaBucket,
+) string {
+	return accountID + "\x00" + string(bucket)
+}
+
+func (m *Multiplexer) rememberThreadQuotaBucket(
+	threadID string,
+	bucket quotaBucket,
+) {
+	if threadID == "" {
+		return
+	}
+
+	m.threadQuotaMu.Lock()
+	m.threadQuotaBuckets[threadID] = bucket
+	m.threadQuotaMu.Unlock()
+}
+
+func (m *Multiplexer) rememberExplicitThreadQuotaBucket(
+	threadID string,
+	params json.RawMessage,
+) {
+	bucket, ok := quotaBucketOverrideFromParams(params)
+	if !ok {
+		return
+	}
+
+	m.rememberThreadQuotaBucket(threadID, bucket)
+}
+
+func (m *Multiplexer) cachedThreadQuotaBucket(
+	threadID string,
+) (quotaBucket, bool) {
+	if threadID == "" {
+		return quotaBucketNormal, false
+	}
+
+	m.threadQuotaMu.RLock()
+	bucket, ok := m.threadQuotaBuckets[threadID]
+	m.threadQuotaMu.RUnlock()
+
+	return bucket, ok
+}
+
+func (m *Multiplexer) threadQuotaBucket(
+	threadID string,
+	params json.RawMessage,
+) quotaBucket {
+	if bucket, ok := quotaBucketOverrideFromParams(params); ok {
+		m.rememberThreadQuotaBucket(threadID, bucket)
+		return bucket
+	}
+
+	if bucket, ok := m.cachedThreadQuotaBucket(threadID); ok {
+		return bucket
+	}
+
+	if threadID != "" {
+		root := m.rootThreadID(threadID)
+		if root != "" && root != threadID {
+			if bucket, ok := m.cachedThreadQuotaBucket(root); ok {
+				return bucket
+			}
+		}
+	}
+
+	return quotaBucketNormal
+}
+
+func (m *Multiplexer) rememberQuotaBucketFromRoute(
+	route externalRoute,
+	result json.RawMessage,
+) {
+	switch route.method {
+	case "thread/start":
+		threadID := threadIDFromResult(result)
+		if threadID == "" {
+			return
+		}
+
+		bucket, ok := quotaBucketOverrideFromParams(
+			route.message.Params,
+		)
+		if !ok {
+			bucket = quotaBucketNormal
+		}
+
+		m.rememberThreadQuotaBucket(threadID, bucket)
+
+	case "turn/start", "thread/settings/update", "thread/resume":
+		threadID := threadIDFromParams(route.message.Params)
+		m.rememberExplicitThreadQuotaBucket(
+			threadID,
+			route.message.Params,
+		)
+	}
+}
+
 type serverRequestRoute struct {
 	accountID string
 	original  json.RawMessage
@@ -87,6 +274,9 @@ type Multiplexer struct {
 
 	quotaMu      sync.Mutex
 	quotaBlocked map[string]time.Time
+
+	threadQuotaMu      sync.RWMutex
+	threadQuotaBuckets map[string]quotaBucket
 
 	lineageMu     sync.RWMutex
 	threadParents map[string]string
@@ -138,6 +328,7 @@ func New(options Options) (*Multiplexer, error) {
 		externalRoutes:       make(map[string]externalRoute),
 		activeTurns:          make(map[string]activeTurn),
 		quotaBlocked:         make(map[string]time.Time),
+		threadQuotaBuckets:   make(map[string]quotaBucket),
 		threadParents:        make(map[string]string),
 		staleSources:         make(map[string]map[string]struct{}),
 		commandPIDs:          make(map[string]map[int]string),
@@ -295,10 +486,21 @@ func (m *Multiplexer) handleClientNotification(message protocol.Message) {
 func (m *Multiplexer) routeNewThread(message protocol.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	account, reason, err := m.chooseAccount(ctx)
+	bucket := quotaBucketFromParams(message.Params)
+	account, reason, err := m.chooseAccountForQuotaBucket(
+		ctx,
+		nil,
+		bucket,
+	)
 	if err != nil {
 		if errors.Is(err, errNoSubscriptionCapacity) {
-			m.write(m.allSubscriptionsDepleted(ctx, message.ID))
+			m.write(
+				m.allSubscriptionsDepletedForQuotaBucket(
+					ctx,
+					message.ID,
+					bucket,
+				),
+			)
 			return
 		}
 		m.write(protocol.Failure(message.ID, -32020, err.Error()))
@@ -328,6 +530,17 @@ func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
 		}
 	}
 	threadID := threadIDFromParams(message.Params)
+
+	if threadID != "" {
+		switch message.Method {
+		case "turn/start", "thread/settings/update", "thread/resume":
+			m.rememberExplicitThreadQuotaBucket(
+				threadID,
+				message.Params,
+			)
+		}
+	}
+
 	if threadID != "" {
 		accountID, _ = m.store.ThreadOwner(threadID)
 	}
@@ -397,6 +610,11 @@ func (m *Multiplexer) rememberActiveTurn(
 		return
 	}
 
+	m.rememberExplicitThreadQuotaBucket(
+		threadID,
+		message.Params,
+	)
+
 	m.activeTurnMu.Lock()
 	active := m.activeTurns[threadID]
 	active.accountID = accountID
@@ -453,19 +671,65 @@ func (m *Multiplexer) clearActiveTurn(
 	delete(m.activeTurns, threadID)
 }
 
+func (m *Multiplexer) AccountUsage(
+	ctx context.Context,
+	accountID string,
+) (json.RawMessage, error) {
+	account, ok := m.store.Account(accountID)
+	if !ok {
+		return nil, fmt.Errorf("unknown account %q", accountID)
+	}
+	if !account.Enabled {
+		return nil, fmt.Errorf("account %q is disabled", accountID)
+	}
+
+	child, err := m.startChild(ctx, account)
+	if err != nil {
+		return nil, fmt.Errorf("start account %q: %w", accountID, err)
+	}
+
+	response, err := child.Request(
+		ctx,
+		"account/usage/read",
+		json.RawMessage(`{}`),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("account/usage/read for %q: %w", accountID, err)
+	}
+
+	return append(json.RawMessage(nil), response.Result...), nil
+}
+
+func (m *Multiplexer) aggregatedRateLimitPayload(
+	ctx context.Context,
+) (map[string]any, error) {
+	rateLimits, byLimitID, err := m.AggregatedRateLimitState(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]any{
+		"rateLimits":          rateLimits,
+		"rateLimitsByLimitId": byLimitID,
+	}, nil
+}
+
 func (m *Multiplexer) routeAggregatedRateLimits(message protocol.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	rateLimits, err := m.AggregatedRateLimits(ctx)
+
+	payload, err := m.aggregatedRateLimitPayload(ctx)
 	if err != nil {
 		m.write(protocol.Failure(message.ID, -32024, err.Error()))
 		return
 	}
-	result, err := json.Marshal(map[string]any{"rateLimits": rateLimits})
+
+	result, err := json.Marshal(payload)
 	if err != nil {
 		m.write(protocol.Failure(message.ID, -32025, err.Error()))
 		return
 	}
+
 	m.write(protocol.Success(message.ID, result))
 }
 
@@ -474,15 +738,31 @@ func (m *Multiplexer) routeTurnStart(
 	threadID string,
 	ownerID string,
 ) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-	snapshot, err := m.accountSnapshotWithProfile(ctx, ownerID, false)
+	bucket := m.threadQuotaBucket(
+		threadID,
+		message.Params,
+	)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		2*requestTimeout,
+	)
+	snapshot, err := m.accountSnapshotWithProfile(
+		ctx,
+		ownerID,
+		false,
+	)
 	cancel()
 
 	if err == nil &&
-		!m.accountQuotaBlocked(ownerID) &&
-		accountHasCapacity(snapshot) {
+		!m.accountQuotaBlockedFor(ownerID, bucket) &&
+		accountHasCapacityForQuotaBucket(snapshot, bucket) {
 		if err := m.forward(ownerID, message); err != nil {
-			m.write(protocol.Failure(message.ID, -32023, err.Error()))
+			m.write(protocol.Failure(
+				message.ID,
+				-32023,
+				err.Error(),
+			))
 		}
 		return
 	}
@@ -498,7 +778,12 @@ func (m *Multiplexer) routeTurnStart(
 	}
 
 	excluded := map[string]struct{}{ownerID: {}}
-	go m.robustFailoverTurn(message, threadID, ownerID, excluded)
+	go m.robustFailoverTurn(
+		message,
+		threadID,
+		ownerID,
+		excluded,
+	)
 }
 
 func (m *Multiplexer) failoverTurn(
@@ -661,10 +946,28 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 
 		if ok {
 			if route.method == "turn/start" && isUsageLimitResponse(message) {
-				m.markAccountQuotaBlocked(inbound.AccountID)
-				go m.retryTurnAfterUsageLimitRobust(route, inbound.AccountID)
+				threadID := threadIDFromParams(
+					route.message.Params,
+				)
+				bucket := m.threadQuotaBucket(
+					threadID,
+					route.message.Params,
+				)
+				m.markAccountQuotaBlockedFor(
+					inbound.AccountID,
+					bucket,
+				)
+				go m.retryTurnAfterUsageLimitRobust(
+					route,
+					inbound.AccountID,
+				)
 				return
 			}
+
+			m.rememberQuotaBucketFromRoute(
+				route,
+				message.Result,
+			)
 			m.learnThreadOwner(route, inbound.AccountID, message.Result)
 			m.writeRaw(inbound.Raw)
 		}
@@ -700,14 +1003,12 @@ func (m *Multiplexer) publishAggregatedRateLimits() {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
-	rateLimits, err := m.AggregatedRateLimits(ctx)
+	payload, err := m.aggregatedRateLimitPayload(ctx)
 	if err != nil {
 		return
 	}
 
-	params, err := json.Marshal(map[string]any{
-		"rateLimits": rateLimits,
-	})
+	params, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
@@ -721,12 +1022,12 @@ func (m *Multiplexer) publishAggregatedRateLimits() {
 func (m *Multiplexer) forwardAggregatedRateLimitNotification(fallback []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	rateLimits, err := m.AggregatedRateLimits(ctx)
+	payload, err := m.aggregatedRateLimitPayload(ctx)
 	if err != nil {
 		m.writeRaw(fallback)
 		return
 	}
-	params, err := json.Marshal(map[string]any{"rateLimits": rateLimits})
+	params, err := json.Marshal(payload)
 	if err != nil {
 		m.writeRaw(fallback)
 		return
@@ -754,10 +1055,11 @@ func (m *Multiplexer) handleTrackedTurnCompleted(
 		return
 	}
 
-	if _, ok := m.activeTurnFor(
+	active, ok := m.activeTurnFor(
 		threadID,
 		inbound.AccountID,
-	); !ok {
+	)
+	if !ok {
 		m.writeRaw(raw)
 		return
 	}
@@ -821,7 +1123,11 @@ func (m *Multiplexer) handleTrackedTurnCompleted(
 		return
 	}
 
-	if rateLimitsHaveCapacity(snapshot.RateLimits) {
+	bucket := m.threadQuotaBucket(
+		threadID,
+		active.params,
+	)
+	if accountHasCapacityForQuotaBucket(snapshot, bucket) {
 		// It really was just an empty normal completion.
 		m.clearActiveTurn(
 			threadID,
@@ -860,6 +1166,15 @@ func (m *Multiplexer) continueAutonomousTurnAfterUsageLimit(
 		return
 	}
 
+	bucket := m.threadQuotaBucket(
+		threadID,
+		active.params,
+	)
+	m.markAccountQuotaBlockedFor(
+		exhaustedAccountID,
+		bucket,
+	)
+
 	excluded := cloneAccountSet(active.excluded)
 	if excluded == nil {
 		excluded = make(map[string]struct{})
@@ -875,9 +1190,10 @@ func (m *Multiplexer) continueAutonomousTurnAfterUsageLimit(
 			2*requestTimeout,
 		)
 
-		fallback, _, err := m.chooseAccountExcluding(
+		fallback, _, err := m.chooseAccountForQuotaBucket(
 			ctx,
 			excluded,
+			bucket,
 		)
 
 		if err != nil {
@@ -982,6 +1298,10 @@ func (m *Multiplexer) continueAutonomousTurnAfterUsageLimit(
 
 		if err != nil {
 			if usageLimitText(err.Error()) {
+				m.markAccountQuotaBlockedFor(
+					targetAccountID,
+					bucket,
+				)
 				excluded[targetAccountID] = struct{}{}
 				sourceAccountID = targetAccountID
 				continue
@@ -1248,13 +1568,25 @@ func threadIDFromNotification(params json.RawMessage) string {
 }
 
 func accountHasCapacity(snapshot AccountSnapshot) bool {
+	return accountHasCapacityForQuotaBucket(
+		snapshot,
+		quotaBucketNormal,
+	)
+}
+
+func accountHasCapacityForQuotaBucket(
+	snapshot AccountSnapshot,
+	bucket quotaBucket,
+) bool {
 	if !snapshot.Enabled ||
 		!snapshot.Connected ||
 		snapshot.AuthType != "chatgpt" {
 		return false
 	}
 
-	return rateLimitsHaveCapacity(snapshot.RateLimits)
+	return rateLimitsHaveCapacity(
+		rateLimitsForQuotaBucket(snapshot, bucket),
+	)
 }
 
 func usageLimitText(text string) bool {
@@ -1403,6 +1735,30 @@ func (m *Multiplexer) allSubscriptionsDepleted(ctx context.Context, id json.RawM
 			resetsAt = weekly.ResetsAt
 		}
 	}
+	return allSubscriptionsDepleted(id, resetsAt)
+}
+
+func (m *Multiplexer) allSubscriptionsDepletedForQuotaBucket(
+	ctx context.Context,
+	id json.RawMessage,
+	bucket quotaBucket,
+) protocol.Message {
+	if bucket != quotaBucketReserve {
+		return m.allSubscriptionsDepleted(ctx, id)
+	}
+
+	var resetsAt *int64
+
+	_, byLimitID, err := m.AggregatedRateLimitState(ctx)
+	if err == nil {
+		limits := reserveRateLimitsFromMap(byLimitID)
+		weekly, _ := longestAndShortestWindow(limits)
+
+		if weekly != nil {
+			resetsAt = weekly.ResetsAt
+		}
+	}
+
 	return allSubscriptionsDepleted(id, resetsAt)
 }
 

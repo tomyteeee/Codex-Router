@@ -57,11 +57,11 @@ func (m *Multiplexer) SetRateLimitPreview(ctx context.Context, preview RateLimit
 		return errors.New("unsupported rate-limit preview mode")
 	}
 
-	limits, err := m.AggregatedRateLimits(ctx)
+	payload, err := m.aggregatedRateLimitPayload(ctx)
 	if err != nil {
 		return err
 	}
-	params, err := json.Marshal(map[string]any{"rateLimits": limits})
+	params, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}

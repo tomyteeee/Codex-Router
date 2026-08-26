@@ -28,27 +28,30 @@ type RateLimitWindow struct {
 }
 
 type RateLimits struct {
+	LimitID              *string          `json:"limitId,omitempty"`
+	LimitName            *string          `json:"limitName,omitempty"`
 	Primary              *RateLimitWindow `json:"primary"`
 	Secondary            *RateLimitWindow `json:"secondary"`
 	RateLimitReachedType any              `json:"rateLimitReachedType"`
 }
 
 type AccountSnapshot struct {
-	ID              string          `json:"id"`
-	Label           string          `json:"label"`
-	Enabled         bool            `json:"enabled"`
-	Controller      bool            `json:"controller"`
-	Connected       bool            `json:"connected"`
-	Email           string          `json:"email,omitempty"`
-	PlanType        string          `json:"planType,omitempty"`
-	PlanLabel       string          `json:"planLabel,omitempty"`
-	AuthType        string          `json:"authType,omitempty"`
-	ProfileImageURL string          `json:"profileImageUrl,omitempty"`
-	RateLimits      *RateLimits     `json:"rateLimits,omitempty"`
-	ThreadCount     int             `json:"threadCount"`
-	Error           string          `json:"error,omitempty"`
-	CreatedAt       int64           `json:"createdAt"`
-	RawAccount      json.RawMessage `json:"-"`
+	ID                  string                 `json:"id"`
+	Label               string                 `json:"label"`
+	Enabled             bool                   `json:"enabled"`
+	Controller          bool                   `json:"controller"`
+	Connected           bool                   `json:"connected"`
+	Email               string                 `json:"email,omitempty"`
+	PlanType            string                 `json:"planType,omitempty"`
+	PlanLabel           string                 `json:"planLabel,omitempty"`
+	AuthType            string                 `json:"authType,omitempty"`
+	ProfileImageURL     string                 `json:"profileImageUrl,omitempty"`
+	RateLimits          *RateLimits            `json:"rateLimits,omitempty"`
+	RateLimitsByLimitID map[string]*RateLimits `json:"rateLimitsByLimitId,omitempty"`
+	ThreadCount         int                    `json:"threadCount"`
+	Error               string                 `json:"error,omitempty"`
+	CreatedAt           int64                  `json:"createdAt"`
+	RawAccount          json.RawMessage        `json:"-"`
 }
 
 type RouteReason struct {
@@ -197,10 +200,12 @@ func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID 
 			rateResponse, rateErr := child.Request(ctx, "account/rateLimits/read", nil)
 			if rateErr == nil {
 				var rateResult struct {
-					RateLimits RateLimits `json:"rateLimits"`
+					RateLimits          RateLimits             `json:"rateLimits"`
+					RateLimitsByLimitID map[string]*RateLimits `json:"rateLimitsByLimitId"`
 				}
 				if json.Unmarshal(rateResponse.Result, &rateResult) == nil {
 					snapshot.RateLimits = &rateResult.RateLimits
+					snapshot.RateLimitsByLimitID = rateResult.RateLimitsByLimitID
 				}
 			}
 		}
@@ -234,12 +239,34 @@ func planLabel(planType string) string {
 	}
 }
 
-func (m *Multiplexer) chooseAccount(ctx context.Context) (state.Account, RouteReason, error) {
-	return m.chooseAccountExcluding(ctx, nil)
+func (m *Multiplexer) chooseAccount(
+	ctx context.Context,
+) (state.Account, RouteReason, error) {
+	return m.chooseAccountForQuotaBucket(
+		ctx,
+		nil,
+		quotaBucketNormal,
+	)
 }
 
-func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[string]struct{}) (state.Account, RouteReason, error) {
+func (m *Multiplexer) chooseAccountExcluding(
+	ctx context.Context,
+	excluded map[string]struct{},
+) (state.Account, RouteReason, error) {
+	return m.chooseAccountForQuotaBucket(
+		ctx,
+		excluded,
+		quotaBucketNormal,
+	)
+}
+
+func (m *Multiplexer) chooseAccountForQuotaBucket(
+	ctx context.Context,
+	excluded map[string]struct{},
+	bucket quotaBucket,
+) (state.Account, RouteReason, error) {
 	snapshots := m.accountSnapshots(ctx, false)
+
 	type candidate struct {
 		account      state.Account
 		reason       RouteReason
@@ -249,30 +276,44 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 		resetCredits resetCreditMetadata
 		urgency      float64
 	}
+
 	candidates := make([]candidate, 0, len(snapshots))
+
 	for _, snapshot := range snapshots {
 		if _, skip := excluded[snapshot.ID]; skip {
 			continue
 		}
-		if m.accountQuotaBlocked(snapshot.ID) {
+
+		if m.accountQuotaBlockedFor(snapshot.ID, bucket) {
 			continue
 		}
-		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
+
+		if !snapshot.Enabled ||
+			!snapshot.Connected ||
+			snapshot.AuthType != "chatgpt" {
 			continue
 		}
+
 		account, ok := m.store.Account(snapshot.ID)
 		if !ok {
 			continue
 		}
-		if snapshot.RateLimits == nil {
+
+		limits := rateLimitsForQuotaBucket(snapshot, bucket)
+		if limits == nil {
+			// Especially important for Luna Reserve: no bucket means the
+			// subscription is not Reserve-eligible.
 			continue
 		}
-		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
-		if !rateLimitsHaveCapacity(snapshot.RateLimits) {
+
+		weekly, short := longestAndShortestWindow(limits)
+
+		if !rateLimitsHaveCapacity(limits) {
 			continue
 		}
-		// Completely untouched subscription.
-		// Valid rate-limit state with no active windows means 0% usage.
+
+		// Valid quota state with no active windows represents untouched
+		// allowance.
 		if weekly == nil && short == nil {
 			weeklyMinutes := int64(10080)
 			weekly = &RateLimitWindow{
@@ -283,61 +324,97 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 
 		weeklyUsed := 0.0
 		shortUsed := 0.0
-		reason := RouteReason{ThreadCount: snapshot.ThreadCount}
+
+		reason := RouteReason{
+			ThreadCount: snapshot.ThreadCount,
+		}
+
 		if weekly != nil {
 			weeklyUsed = weekly.UsedPercent
 			reason.WeeklyUsedPercent = &weekly.UsedPercent
+
 			if weekly.ResetsAt != nil {
 				value := *weekly.ResetsAt
 				reason.WeeklyResetsAt = &value
 			}
 		}
+
 		if short != nil {
 			shortUsed = short.UsedPercent
 			reason.ShortUsedPercent = &short.UsedPercent
 		}
+
 		candidates = append(candidates, candidate{
-			account: account, reason: reason, weekly: weekly,
-			weeklyUsed: weeklyUsed, shortUsed: shortUsed,
+			account:    account,
+			reason:     reason,
+			weekly:     weekly,
+			weeklyUsed: weeklyUsed,
+			shortUsed:  shortUsed,
 		})
 	}
+
 	if len(candidates) == 0 {
-		return state.Account{}, RouteReason{}, errNoSubscriptionCapacity
+		return state.Account{},
+			RouteReason{},
+			errNoSubscriptionCapacity
 	}
 
-	type resetResult struct {
-		index    int
-		metadata resetCreditMetadata
-	}
-	resetResults := make(chan resetResult, len(candidates))
-	for index := range candidates {
-		go func(index int, account state.Account) {
-			resetResults <- resetResult{
-				index: index, metadata: m.routingResetCredits(ctx, account),
+	// Reset credits are associated with normal Codex quota. Do not let those
+	// credits distort selection among separate Luna Reserve allowances.
+	if bucket == quotaBucketNormal {
+		type resetResult struct {
+			index    int
+			metadata resetCreditMetadata
+		}
+
+		resetResults := make(
+			chan resetResult,
+			len(candidates),
+		)
+
+		for index := range candidates {
+			go func(index int, account state.Account) {
+				resetResults <- resetResult{
+					index: index,
+					metadata: m.routingResetCredits(
+						ctx,
+						account,
+					),
+				}
+			}(index, candidates[index].account)
+		}
+
+	collectResetCredits:
+		for received := 0; received < len(candidates); received++ {
+			select {
+			case result := <-resetResults:
+				candidates[result.index].resetCredits =
+					result.metadata
+			case <-ctx.Done():
+				break collectResetCredits
 			}
-		}(index, candidates[index].account)
-	}
-
-collectResetCredits:
-	for received := 0; received < len(candidates); received++ {
-		select {
-		case result := <-resetResults:
-			candidates[result.index].resetCredits = result.metadata
-		case <-ctx.Done():
-			break collectResetCredits
 		}
 	}
 
 	now := m.now()
+
 	for index := range candidates {
 		entry := &candidates[index]
-		entry.urgency = routeUrgencyScore(now, entry.weekly, entry.resetCredits)
+
+		entry.urgency = routeUrgencyScore(
+			now,
+			entry.weekly,
+			entry.resetCredits,
+		)
+
 		urgency := entry.urgency
 		entry.reason.UrgencyScore = &urgency
+
 		if entry.resetCredits.Known {
 			count := entry.resetCredits.AvailableCount
 			entry.reason.BankedResetCount = &count
 		}
+
 		if entry.resetCredits.EarliestExpiry != nil {
 			expiresAt := *entry.resetCredits.EarliestExpiry
 			entry.reason.ResetCreditExpiresAt = &expiresAt
@@ -346,21 +423,31 @@ collectResetCredits:
 
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
+
 		if math.Abs(left.urgency-right.urgency) > 0.000001 {
 			return left.urgency > right.urgency
 		}
+
 		if math.Abs(left.shortUsed-right.shortUsed) > 0.001 {
 			return left.shortUsed < right.shortUsed
 		}
+
 		if math.Abs(left.weeklyUsed-right.weeklyUsed) > 0.001 {
 			return left.weeklyUsed < right.weeklyUsed
 		}
+
 		if left.reason.ThreadCount != right.reason.ThreadCount {
-			return left.reason.ThreadCount < right.reason.ThreadCount
+			return left.reason.ThreadCount <
+				right.reason.ThreadCount
 		}
-		return left.account.CreatedAt < right.account.CreatedAt
+
+		return left.account.CreatedAt <
+			right.account.CreatedAt
 	})
-	return candidates[0].account, candidates[0].reason, nil
+
+	return candidates[0].account,
+		candidates[0].reason,
+		nil
 }
 
 func routeUrgencyScore(now time.Time, weekly *RateLimitWindow, credits resetCreditMetadata) float64 {
@@ -390,14 +477,30 @@ func routeUrgencyScore(now time.Time, weekly *RateLimitWindow, credits resetCred
 }
 
 func (m *Multiplexer) AggregatedRateLimits(ctx context.Context) (*RateLimits, error) {
-	limits, err := aggregateRateLimits(m.accountSnapshots(ctx, false))
+	limits, _, err := m.AggregatedRateLimitState(ctx)
+	return limits, err
+}
+
+func (m *Multiplexer) AggregatedRateLimitState(
+	ctx context.Context,
+) (*RateLimits, map[string]*RateLimits, error) {
+	snapshots := m.accountSnapshots(ctx, false)
+
+	limits, err := aggregateRateLimits(snapshots)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	byLimitID, err := aggregateRateLimitsByLimitID(snapshots)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	if preview := m.currentRateLimitPreview(); preview != nil && preview.Mode.isAllDepleted() {
 		limits.RateLimitReachedType = "legacy_rate_limit_reached"
 	}
-	return limits, nil
+
+	return limits, byLimitID, nil
 }
 
 func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
@@ -525,6 +628,22 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 
 	result := &RateLimits{}
 
+	for _, snapshot := range eligible {
+		if snapshot.RateLimits == nil {
+			continue
+		}
+
+		if result.LimitID == nil && snapshot.RateLimits.LimitID != nil {
+			value := *snapshot.RateLimits.LimitID
+			result.LimitID = &value
+		}
+
+		if result.LimitName == nil && snapshot.RateLimits.LimitName != nil {
+			value := *snapshot.RateLimits.LimitName
+			result.LimitName = &value
+		}
+	}
+
 	if len(pooled) >= 1 {
 		result.Primary = pooled[0]
 	}
@@ -535,6 +654,108 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 
 	if !hasCapacity {
 		result.RateLimitReachedType = "rate_limit_reached"
+	}
+
+	return result, nil
+}
+
+func aggregateRateLimitsByLimitID(
+	snapshots []AccountSnapshot,
+) (map[string]*RateLimits, error) {
+	keys := make(map[string]struct{})
+
+	for _, snapshot := range snapshots {
+		if !snapshot.Enabled ||
+			!snapshot.Connected ||
+			snapshot.AuthType != "chatgpt" {
+			continue
+		}
+
+		for limitID, limits := range snapshot.RateLimitsByLimitID {
+			if limitID == "" || limits == nil {
+				continue
+			}
+			keys[limitID] = struct{}{}
+		}
+	}
+
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	sortedKeys := make([]string, 0, len(keys))
+	for limitID := range keys {
+		sortedKeys = append(sortedKeys, limitID)
+	}
+	sort.Strings(sortedKeys)
+
+	result := make(map[string]*RateLimits, len(sortedKeys))
+
+	for _, limitID := range sortedKeys {
+		contributors := make([]AccountSnapshot, 0, len(snapshots))
+
+		for _, snapshot := range snapshots {
+			if !snapshot.Enabled ||
+				!snapshot.Connected ||
+				snapshot.AuthType != "chatgpt" {
+				continue
+			}
+
+			bucket := snapshot.RateLimitsByLimitID[limitID]
+			if bucket == nil {
+				// Missing bucket is not zero usage. The account may simply not
+				// be eligible for this separately metered model allowance.
+				continue
+			}
+
+			contributors = append(contributors, AccountSnapshot{
+				ID:         snapshot.ID,
+				Enabled:    true,
+				Connected:  true,
+				AuthType:   "chatgpt",
+				RateLimits: bucket,
+			})
+		}
+
+		if len(contributors) == 0 {
+			continue
+		}
+
+		pooled, err := aggregateRateLimits(contributors)
+		if err != nil {
+			return nil, err
+		}
+
+		// The map key remains the server-provided metered limit ID. Preserve
+		// the bucket metadata because Luna Reserve discovery is based on the
+		// separately returned bucket, including its limitName.
+		for _, contributor := range contributors {
+			source := contributor.RateLimits
+			if source == nil {
+				continue
+			}
+
+			if pooled.LimitID == nil && source.LimitID != nil {
+				value := *source.LimitID
+				pooled.LimitID = &value
+			}
+
+			if pooled.LimitName == nil && source.LimitName != nil {
+				value := *source.LimitName
+				pooled.LimitName = &value
+			}
+		}
+
+		if pooled.LimitID == nil {
+			value := limitID
+			pooled.LimitID = &value
+		}
+
+		result[limitID] = pooled
+	}
+
+	if len(result) == 0 {
+		return nil, nil
 	}
 
 	return result, nil

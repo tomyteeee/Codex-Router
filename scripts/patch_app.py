@@ -803,7 +803,26 @@ def ensure_asar_tool() -> Path:
     return asar
 
 
-def patch_renderer(extracted: Path, token: str) -> None:
+
+def replace_javascript_identifiers(
+    source: str, replacements: dict[str, str]
+) -> str:
+    """Retarget injected source to the minified imports in a supported build."""
+    for original, replacement in replacements.items():
+        pattern = rf"(?<![A-Za-z0-9_$]){re.escape(original)}(?![A-Za-z0-9_$])"
+        source, count = re.subn(pattern, replacement, source)
+        if count == 0:
+            raise RuntimeError(
+                f"could not retarget injected JavaScript identifier {original!r}"
+            )
+    return source
+
+
+def patch_renderer(
+    extracted: Path,
+    token: str,
+    source_build: tuple[str, str],
+) -> None:
     webview = extracted / "webview"
     index_path = webview / "index.html"
     index = index_path.read_text(encoding="utf-8")
@@ -831,31 +850,71 @@ def patch_renderer(extracted: Path, token: str) -> None:
     component = (PROJECT_ROOT / "ui" / "account-menu.js").read_text(encoding="utf-8")
     component = component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT))
     component = component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
-    # ChatGPT 26.818.61809 / build 7019
-    component_anchor = (
-        "function Aql(e){let t=(0,Fql.c)(253),"
-        "{sidebarFooter:n,triggerButton:r}=e"
-    )
+
+    if source_build == ("26.818.61809", "7019"):
+        component_anchor = (
+            "function Aql(e){let t=(0,Fql.c)(253),"
+            "{sidebarFooter:n,triggerButton:r}=e"
+        )
+        component_identifier_replacements: dict[str, str] = {}
+        component_jsx_alias = "d7"
+        plugin_rpc_mapping_anchors = (
+            "Lg(e,n).sendRequest(`app/list`,{cursor:i,limit:K5r,forceRefetch:t},{trace:a})",
+            "Lg(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+            "map(t=>Lg(e,n).sendRequest(`app/read`,{appIds:t}))",
+            "t.sendRequest(`mcpServer/oauth/login`,e)",
+            "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e})",
+            "let i=this.sendRequest(`mcpServerStatus/list`,e,t);",
+        )
+        open_change_anchors = (
+            "triggerButton:Dt,onOpenChange:l,children:P",
+            "open:s,onOpenChange:l,contentWidth:`panel`,triggerButton:Dt",
+        )
+    elif source_build == ("26.820.60940", "7119"):
+        component_anchor = (
+            "function zbl(e){let t=(0,Wbl.c)(252),"
+            "{sidebarFooter:n,triggerButton:r}=e"
+        )
+        # The injected component intentionally depends on only the native JSX
+        # runtime, React namespace, and query client. ct() is unchanged in 7119.
+        component_identifier_replacements = {
+            "d7": "m8",
+            "Esc": "WI",
+        }
+        component_jsx_alias = "m8"
+        plugin_rpc_mapping_anchors = (
+            "zg(e,n).sendRequest(`app/list`,{cursor:i,limit:H9r,forceRefetch:t},{trace:a})",
+            "zg(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+            "map(t=>zg(e,n).sendRequest(`app/read`,{appIds:t}))",
+            "t.sendRequest(`mcpServer/oauth/login`,e)",
+            "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e})",
+            "let i=this.sendRequest(`mcpServerStatus/list`,e,t);",
+        )
+        open_change_anchors = (
+            "triggerButton:Dt,onOpenChange:l,children:N",
+        )
+    else:
+        raise RuntimeError(
+            "no renderer compatibility map exists for "
+            f"ChatGPT {source_build[0]} ({source_build[1]})"
+        )
+
+    if component_identifier_replacements:
+        component = replace_javascript_identifiers(
+            component,
+            component_identifier_replacements,
+        )
 
     if bundle.count(component_anchor) != 1:
         raise RuntimeError(
-            "could not find the native ChatGPT 26.818 profile menu component"
+            "could not find the native ChatGPT profile menu component for "
+            f"{source_build[0]} ({source_build[1]})"
         )
 
     bundle = bundle.replace(
         component_anchor,
         component + "\n" + component_anchor,
         1,
-    )
-
-    # ChatGPT 26.818.61809 / build 7019
-    plugin_rpc_mapping_anchors = (
-        "Lg(e,n).sendRequest(`app/list`,{cursor:i,limit:K5r,forceRefetch:t},{trace:a})",
-        "Lg(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
-        "map(t=>Lg(e,n).sendRequest(`app/read`,{appIds:t}))",
-        "t.sendRequest(`mcpServer/oauth/login`,e)",
-        "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e})",
-        "let i=this.sendRequest(`mcpServerStatus/list`,e,t);",
     )
 
     for mapping_anchor in plugin_rpc_mapping_anchors:
@@ -937,133 +996,19 @@ def patch_renderer(extracted: Path, token: str) -> None:
         + bundle[profile_query_match.end():]
     )
 
-    # ChatGPT 26.818.61809 / build 7019
-    native_usage_modal_anchor = (
-        "function Ssc(e){let t=(0,Tsc.c)(96),"
-        "{availableCount:n,availableResetCredits:r,defaultResetCreditsOpen:i"
-    )
-
-    if bundle.count(native_usage_modal_anchor) != 1:
-        raise RuntimeError(
-            "could not find the native ChatGPT 26.818 Usage modal component"
-        )
-
-    bundle = bundle.replace(
-        native_usage_modal_anchor,
-        "function Ssc(e){CodexMuxUseResetAccountState();"
-        "let t=(0,Tsc.c)(96),"
-        "{availableCount:n,availableResetCredits:r,defaultResetCreditsOpen:i",
-        1,
-    )
-
-    # Patch reset-credit query structurally instead of relying on
-    # minified function/cache names.
-    reset_query_pattern = re.compile(
-        r"queryKey:\[`rate-limit-reset-credits`\],"
-        r"queryFn:(?P<query_fn>[A-Za-z_$][\w$]*),"
-        r"refetchInterval:(?P<timer>[A-Za-z_$][\w$]*)\.ONE_MINUTE,"
-        r"staleTime:(?P=timer)\.FIVE_SECONDS"
-    )
-
-    reset_query_matches = list(reset_query_pattern.finditer(bundle))
-
-    if len(reset_query_matches) != 1:
-        pos = bundle.find("rate-limit-reset-credits")
-        sample = (
-            bundle[max(0, pos - 700):pos + 1000]
-            if pos != -1
-            else "rate-limit-reset-credits not found"
-        )
-        raise RuntimeError(
-            "could not uniquely identify the native reset-credit query; "
-            f"found {len(reset_query_matches)} candidates; sample={sample}"
-        )
-
-    reset_query_match = reset_query_matches[0]
-    native_query_fn = reset_query_match.group("query_fn")
-    timer = reset_query_match.group("timer")
-
-    reset_query_replacement = (
-        "queryKey:[`rate-limit-reset-credits`,"
-        "window.__codexMuxResetAccountId??`primary`],"
-        "queryFn:window.__codexMuxResetAccountId?"
-        "()=>codexMuxRateLimitResets(window.__codexMuxResetAccountId):"
-        f"{native_query_fn},"
-        f"refetchInterval:{timer}.ONE_MINUTE,"
-        f"staleTime:{timer}.FIVE_SECONDS"
-    )
-
-    bundle = (
-        bundle[:reset_query_match.start()]
-        + reset_query_replacement
-        + bundle[reset_query_match.end():]
-    )
-
-    # ChatGPT 26.818.61809 / build 7019
-    reset_mutation_anchor = (
-        "function kCa(){let e=(0,MV.c)(3),t=ct(),n=gb(),r;return "
-        "e[0]!==n||e[1]!==t?(r={mutationFn:ACa,onSuccess:(e,r)=>{"
-        "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
-        "let n=e.code===`reset`?e.credit?.id??i:i;"
-        "t.setQueryData([`rate-limit-reset-credits`],e=>$Sa(e,a,n))}"
-        "Promise.all([n([`rate-limit-status`]),n([`rate-limit-reset-credits`])])}},"
-        "e[0]=n,e[1]=t,e[2]=r):r=e[2],Qt(r)}"
-    )
-
-    if bundle.count(reset_mutation_anchor) != 1:
-        raise RuntimeError("could not find the native 26.818 reset-credit mutation")
-
-    bundle = bundle.replace(
-        reset_mutation_anchor,
-        "function kCa(){let e=ct(),t=gb(),n=window.__codexMuxResetAccountId,"
-        "r=[`rate-limit-reset-credits`,n??`primary`];return Qt({"
-        "mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):ACa,"
-        "onSuccess:(n,i)=>{let{creditId:a}=i,o=n.code;"
-        "if(o===`reset`||o===`already_redeemed`){"
-        "let t=o===`reset`?n.credit?.id??a:a;"
-        "e.setQueryData(r,e=>$Sa(e,o,t))}"
-        "Promise.all([t([`rate-limit-status`]),t(r)])}})}",
-        1,
-    )
-
-    selected_usage_anchor = "let y=v;if(g!=null){"
-    if bundle.count(selected_usage_anchor) != 1:
-        raise RuntimeError("could not find the native usage-window selection")
-    bundle = bundle.replace(
-        selected_usage_anchor,
-        "let y=window.__codexMuxSelectedUsageWindows??v;if(g!=null){",
-        1,
-    )
-
-    # ChatGPT 26.818 Usage sheet
-    usage_header_anchor = (
-        "let _e;t[46]===he?_e=t[47]:"
-        "(_e=(0,u0.jsxs)(LR,{children:[he,ge]}),t[46]=he,t[47]=_e);"
-    )
-
-    if bundle.count(usage_header_anchor) != 1:
-        raise RuntimeError("could not find the native 26.818 Usage sheet header")
-
-    bundle = bundle.replace(
-        usage_header_anchor,
-        "let _e=(0,u0.jsxs)(LR,{children:[he,ge,"
-        "window.__codexMuxResetAccountSelector??null]});",
-        1,
-    )
-
+    # Keep usage rendering owned by CodexMuxAccountMenu. Older versions of
+    # this patch rewrote the native reset modal, query, mutation, and usage
+    # sheet internals; those minified bindings changed frequently and were the
+    # source of profile/usage renderer crashes.
     usage_anchor = "usageItems:Ct"
     if bundle.count(usage_anchor) != 1:
         raise RuntimeError("could not find the native ChatGPT usage menu slot")
     bundle = bundle.replace(
         usage_anchor,
-        "usageItems:(0,d7.jsx)(CodexMuxAccountMenu,{})",
+        f"usageItems:(0,{component_jsx_alias}.jsx)(CodexMuxAccountMenu,{{}})",
         1,
     )
 
-    open_change_anchors = (
-        "triggerButton:Dt,onOpenChange:l,children:P",
-        "open:s,onOpenChange:l,contentWidth:`panel`,triggerButton:Dt",
-    )
     for anchor in open_change_anchors:
         if bundle.count(anchor) != 1:
             raise RuntimeError("could not find a native profile menu open-state hook")
@@ -1076,154 +1021,206 @@ def patch_renderer(extracted: Path, token: str) -> None:
             1,
         )
 
-    # Keep ChatGPT's native per-account rate-limit messages unchanged.
-    # The multiplexer itself reports pool-wide depletion only when no
-    # connected subscription has remaining capacity.
-    # ChatGPT 26.818 obtains the native usage/depletion banner from
-    # /wham/usage rather than account/rateLimits/read. Adapt that response
-    # to the connected subscription pool before React stores it.
-    wham_usage_anchor = (
-        "r={...e,rate_limit_upsell:n.success?"
-        "n.data.rate_limit_upsell:void 0};"
-        "return dSr(t,r),r"
+    # /wham/usage remains the renderer's authoritative usage document in both
+    # supported layouts. Identify the normalized result/store sequence by
+    # structure rather than by the minified store helper name (dSr -> aSr).
+    wham_usage_pattern = re.compile(
+        r"(?P<result>[A-Za-z_$][\w$]*)="
+        r"\{\.\.\.(?P<base>[A-Za-z_$][\w$]*),"
+        r"rate_limit_upsell:(?P<parsed>[A-Za-z_$][\w$]*)\.success\?"
+        r"(?P=parsed)\.data\.rate_limit_upsell:void 0\};"
+        r"return (?P<store>[A-Za-z_$][\w$]*)\("
+        r"(?P<scope>[A-Za-z_$][\w$]*),(?P=result)\),(?P=result)"
     )
-    if bundle.count(wham_usage_anchor) != 1:
+    wham_usage_matches = list(wham_usage_pattern.finditer(bundle))
+    if len(wham_usage_matches) != 1:
         raise RuntimeError(
-            "could not find the ChatGPT 26.818 /wham/usage result anchor"
+            "could not uniquely identify the ChatGPT /wham/usage result anchor; "
+            f"found {len(wham_usage_matches)} candidates"
         )
-
-    bundle = bundle.replace(
-        wham_usage_anchor,
-        (
-            "r={...e,rate_limit_upsell:n.success?"
-            "n.data.rate_limit_upsell:void 0};"
-            "r=await codexMuxPooledUsageStatus(r);"
-            "return dSr(t,r),r"
-        ),
-        1,
+    wham_usage_match = wham_usage_matches[0]
+    result_var = wham_usage_match.group("result")
+    store_var = wham_usage_match.group("store")
+    scope_var = wham_usage_match.group("scope")
+    normalized = wham_usage_match.group(0).split(";return ", 1)[0]
+    wham_usage_replacement = (
+        normalized
+        + f";{result_var}=await codexMuxPooledUsageStatus({result_var});"
+        + f"return {store_var}({scope_var},{result_var}),{result_var}"
+    )
+    bundle = (
+        bundle[:wham_usage_match.start()]
+        + wham_usage_replacement
+        + bundle[wham_usage_match.end():]
     )
 
     bundle_path.write_text(bundle, encoding="utf-8")
 
-    profile_bundles = list((webview / "assets").glob("profile-*.js"))
-    if len(profile_bundles) != 1:
-        raise RuntimeError(
-            f"expected one native Profile settings bundle, found {len(profile_bundles)}"
-        )
-    profile_bundle_path = profile_bundles[0]
-    profile_bundle = profile_bundle_path.read_text(encoding="utf-8")
-    # ChatGPT 26.818 Profile page.
-    # Match structural UI instead of minified helper names.
+    if source_build == ("26.818.61809", "7019"):
+        profile_bundles = list((webview / "assets").glob("profile-*.js"))
+        if len(profile_bundles) != 1:
+            raise RuntimeError(
+                f"expected one native Profile settings bundle, found {len(profile_bundles)}"
+            )
+        profile_bundle_path = profile_bundles[0]
+        profile_bundle = profile_bundle_path.read_text(encoding="utf-8")
+        # ChatGPT 26.818 Profile page.
+        # Match structural UI instead of minified helper names.
 
-    profile_avatar_pattern = re.compile(
-        r"children:\[\(0,(?P<jsx>[A-Za-z_$][\w$]*)\.jsxs\)"
-        r"\(`label`,\{\"aria-disabled\":"
-        r"(?P<pending>[A-Za-z_$][\w$]*)\.isPending,"
-        r"className:(?P<classfn>[A-Za-z_$][\w$]*)"
-        r"\(`group relative flex size-20 rounded-full"
-    )
-
-    profile_avatar_matches = list(profile_avatar_pattern.finditer(profile_bundle))
-
-    if len(profile_avatar_matches) != 1:
-        raise RuntimeError(
-            "could not uniquely identify the native 26.818 Profile avatar; "
-            f"found {len(profile_avatar_matches)} candidates"
+        profile_avatar_pattern = re.compile(
+            r"children:\[\(0,(?P<jsx>[A-Za-z_$][\w$]*)\.jsxs\)"
+            r"\(`label`,\{\"aria-disabled\":"
+            r"(?P<pending>[A-Za-z_$][\w$]*)\.isPending,"
+            r"className:(?P<classfn>[A-Za-z_$][\w$]*)"
+            r"\(`group relative flex size-20 rounded-full"
         )
 
-    avatar_match = profile_avatar_matches[0]
-    jsx = avatar_match.group("jsx")
-    pending = avatar_match.group("pending")
-    classfn = avatar_match.group("classfn")
+        profile_avatar_matches = list(profile_avatar_pattern.finditer(profile_bundle))
 
-    avatar_replacement = (
-        "children:[globalThis.CodexMuxProfileAvatarStack?.("
-        "{onSelect:()=>{}})??null,"
-        f"(0,{jsx}.jsxs)(`label`,{{\"aria-disabled\":{pending}.isPending,"
-        f"className:{classfn}("
-        "globalThis.CodexMuxProfileAvatarStack?"
-        "`hidden`:`group relative flex size-20 rounded-full"
-    )
+        if len(profile_avatar_matches) != 1:
+            raise RuntimeError(
+                "could not uniquely identify the native 26.818 Profile avatar; "
+                f"found {len(profile_avatar_matches)} candidates"
+            )
 
-    profile_bundle = (
-        profile_bundle[:avatar_match.start()]
-        + avatar_replacement
-        + profile_bundle[avatar_match.end():]
-    )
+        avatar_match = profile_avatar_matches[0]
+        jsx = avatar_match.group("jsx")
+        pending = avatar_match.group("pending")
+        classfn = avatar_match.group("classfn")
 
-
-    profile_name_pattern = re.compile(
-        r"\(0,(?P<jsx>[A-Za-z_$][\w$]*)\.jsx\)"
-        r"\(`h1`,\{className:`text-base font-normal text-default`,"
-        r"children:(?P<child>[A-Za-z_$][\w$]*)\}\)"
-    )
-
-    profile_name_matches = list(profile_name_pattern.finditer(profile_bundle))
-
-    if len(profile_name_matches) != 1:
-        raise RuntimeError(
-            "could not uniquely identify the native 26.818 Profile display name; "
-            f"found {len(profile_name_matches)} candidates"
+        avatar_replacement = (
+            f"children:[(0,{jsx}.jsx)(globalThis.CodexMuxProfileAvatarStack,"
+            "{onSelect:()=>{}}),"
+            f"(0,{jsx}.jsxs)(`label`,{{\"aria-disabled\":{pending}.isPending,"
+            f"className:{classfn}("
+            "globalThis.CodexMuxProfileAvatarStack?"
+            "`hidden`:`group relative flex size-20 rounded-full"
         )
 
-    name_match = profile_name_matches[0]
-    jsx = name_match.group("jsx")
-    child = name_match.group("child")
-
-    name_replacement = (
-        f"(0,{jsx}.jsx)(`h1`,{{className:"
-        "globalThis.__codexMuxSelectedProfileAccountId?"
-        "`text-base font-normal text-default`:`hidden`,"
-        f"children:{child}}})"
-    )
-
-    profile_bundle = (
-        profile_bundle[:name_match.start()]
-        + name_replacement
-        + profile_bundle[name_match.end():]
-    )
-
-
-    profile_identity_anchor = (
-        "className:`inline-flex h-6 items-center rounded-lg border border-subtle "
-        "px-[5px] text-sm leading-5 text-tertiary`"
-    )
-
-    if profile_bundle.count(profile_identity_anchor) != 1:
-        raise RuntimeError(
-            "could not find the native 26.818 Profile username/plan badge"
+        profile_bundle = (
+            profile_bundle[:avatar_match.start()]
+            + avatar_replacement
+            + profile_bundle[avatar_match.end():]
         )
 
-    profile_bundle = profile_bundle.replace(
-        profile_identity_anchor,
-        "className:globalThis.__codexMuxSelectedProfileAccountId?"
-        "`inline-flex h-6 items-center rounded-lg border border-subtle "
-        "px-[5px] text-sm leading-5 text-tertiary`:`hidden`",
-        1,
-    )
 
-    profile_bundle_path.write_text(profile_bundle, encoding="utf-8")
-
-    plugin_scope_anchor = "action:F,children:w})"
-    plugin_bundles = [
-        path
-        for path in (webview / "assets").glob("plugins-settings-*.js")
-        if plugin_scope_anchor in path.read_text(encoding="utf-8")
-    ]
-    if len(plugin_bundles) != 1:
-        raise RuntimeError(
-            f"expected one native Plugins settings bundle, found {len(plugin_bundles)}"
+        profile_name_pattern = re.compile(
+            r"\(0,(?P<jsx>[A-Za-z_$][\w$]*)\.jsx\)"
+            r"\(`h1`,\{className:`text-base font-normal text-default`,"
+            r"children:(?P<child>[A-Za-z_$][\w$]*)\}\)"
         )
-    plugin_bundle_path = plugin_bundles[0]
-    plugin_bundle = plugin_bundle_path.read_text(encoding="utf-8")
-    if plugin_bundle.count(plugin_scope_anchor) != 1:
-        raise RuntimeError("could not find the native Plugins settings content")
-    plugin_bundle = plugin_bundle.replace(
-        plugin_scope_anchor,
-        "action:F,children:[globalThis.CodexMuxPluginScope?.()??null,w]})",
-        1,
-    )
-    plugin_bundle_path.write_text(plugin_bundle, encoding="utf-8")
+
+        profile_name_matches = list(profile_name_pattern.finditer(profile_bundle))
+
+        if len(profile_name_matches) != 1:
+            raise RuntimeError(
+                "could not uniquely identify the native 26.818 Profile display name; "
+                f"found {len(profile_name_matches)} candidates"
+            )
+
+        name_match = profile_name_matches[0]
+        jsx = name_match.group("jsx")
+        child = name_match.group("child")
+
+        name_replacement = (
+            f"(0,{jsx}.jsx)(`h1`,{{className:"
+            "globalThis.__codexMuxSelectedProfileAccountId?"
+            "`text-base font-normal text-default`:`hidden`,"
+            f"children:{child}}})"
+        )
+
+        profile_bundle = (
+            profile_bundle[:name_match.start()]
+            + name_replacement
+            + profile_bundle[name_match.end():]
+        )
+
+
+        profile_identity_anchor = (
+            "className:`inline-flex h-6 items-center rounded-lg border border-subtle "
+            "px-[5px] text-sm leading-5 text-tertiary`"
+        )
+
+        if profile_bundle.count(profile_identity_anchor) != 1:
+            raise RuntimeError(
+                "could not find the native 26.818 Profile username/plan badge"
+            )
+
+        profile_bundle = profile_bundle.replace(
+            profile_identity_anchor,
+            "className:globalThis.__codexMuxSelectedProfileAccountId?"
+            "`inline-flex h-6 items-center rounded-lg border border-subtle "
+            "px-[5px] text-sm leading-5 text-tertiary`:`hidden`",
+            1,
+        )
+
+        profile_bundle_path.write_text(profile_bundle, encoding="utf-8")
+
+        plugin_scope_anchor = "action:F,children:w})"
+        plugin_bundles = [
+            path
+            for path in (webview / "assets").glob("plugins-settings-*.js")
+            if plugin_scope_anchor in path.read_text(encoding="utf-8")
+        ]
+        if len(plugin_bundles) != 1:
+            raise RuntimeError(
+                f"expected one native Plugins settings bundle, found {len(plugin_bundles)}"
+            )
+        plugin_bundle_path = plugin_bundles[0]
+        plugin_bundle = plugin_bundle_path.read_text(encoding="utf-8")
+        if plugin_bundle.count(plugin_scope_anchor) != 1:
+            raise RuntimeError("could not find the native Plugins settings content")
+        plugin_bundle = plugin_bundle.replace(
+            plugin_scope_anchor,
+            "action:F,children:[globalThis.CodexMuxPluginScope?.()??null,w]})",
+            1,
+        )
+        plugin_bundle_path.write_text(plugin_bundle, encoding="utf-8")
+    else:
+        # 7119 profile page: keep the native profile transformer and add a
+        # compact subscription selector beside the native Profile heading.
+        profile_bundles = list((webview / "assets").glob("profile-*.js"))
+        if len(profile_bundles) != 1:
+            raise RuntimeError(
+                f"expected one native Profile settings bundle, found {len(profile_bundles)}"
+            )
+        profile_bundle_path = profile_bundles[0]
+        profile_bundle = profile_bundle_path.read_text(encoding="utf-8")
+        profile_header_anchor = (
+            "let Gt;t[68]!==kt||t[69]!==Wt?(Gt=(0,$.jsxs)(`div`,"
+            "{className:`flex w-full items-center justify-between`,"
+            "children:[Tt,(0,$.jsxs)(`div`,"
+            "{className:`-me-2 flex items-center gap-2 no-drag`,"
+            "children:[Et,kt,Nt,Wt]})]}),t[68]=kt,t[69]=Wt,t[70]=Gt):Gt=t[70];"
+        )
+        if profile_bundle.count(profile_header_anchor) != 1:
+            raise RuntimeError(
+                "could not find the native ChatGPT 26.820 Profile header"
+            )
+        profile_header_replacement = profile_header_anchor.replace(
+            "children:[Tt,",
+            "children:[(0,$.jsxs)(`div`,{className:`flex items-center gap-2`,"
+            "children:[(0,$.jsx)(globalThis.CodexMuxProfileAvatarStack,"
+            "{compact:!0}),Tt]}),",
+            1,
+        )
+        profile_bundle = profile_bundle.replace(
+            profile_header_anchor,
+            profile_header_replacement,
+            1,
+        )
+        profile_bundle_path.write_text(profile_bundle, encoding="utf-8")
+
+        # Plugin RPCs are still account-scope aware through the central bridge,
+        # but 7119 split the Plugins settings UI across several lazy chunks.
+        # Leave the visual selector disabled until its new stable structure is
+        # verified rather than binding to another guessed minified name.
+        print(
+            "Warning: ChatGPT 26.820 canary leaves the Plugins settings "
+            "subscription selector disabled; plugin requests default to the "
+            "controller subscription unless another surface sets a scope.",
+            file=sys.stderr,
+        )
 
     thread_bundles = [
         path
@@ -1243,13 +1240,8 @@ def patch_renderer(extracted: Path, token: str) -> None:
         "__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT)
     )
     thread_component = thread_component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
-    # Insert the custom component at module scope.
-    # Imported bindings are module-scoped, so this avoids depending on the
-    # minified name of a particular native function.
-    if "function CodexMuxThreadSubscription(" in thread_bundle:
-        raise RuntimeError("thread bundle already contains CodexMuxThreadSubscription")
-
-    thread_bundle = thread_component + "\n" + thread_bundle
+    # Do not prepend the component yet. First identify native summary
+    # bindings from the untouched lazy chunk.
 
     # Find long simple children arrays. The native summary root has a long
     # ordered list of precomputed section variables.
@@ -1294,7 +1286,7 @@ def patch_renderer(extracted: Path, token: str) -> None:
 
     summary_match, summary_items = best[0]
 
-    # Determine the JSX runtime used by the surrounding native function.
+    # Determine the JSX runtime used by the native summary function.
     nearby = thread_bundle[
         max(0, summary_match.start() - 6000):
         summary_match.start()
@@ -1312,10 +1304,83 @@ def patch_renderer(extracted: Path, token: str) -> None:
 
     jsx_alias = jsx_aliases[-1]
 
-    # PR14 inserted the router subscription immediately after the first
-    # four summary sections. Preserve that ordering.
+    # Locate the local route value already computed by the native summary.
+    #
+    # 7019 currently has the shape:
+    #
+    #   c=$t(ge);
+    #   X(!1,c.value.routeKind===`local-thread`
+    #       ?c.value.conversationId:null);
+    #
+    # Pass the already-computed conversation ID into our component rather
+    # than depending on the minified router/store identifiers ourselves.
+    route_pattern = re.compile(
+        r"(?P<route>[A-Za-z_$][\w$]*)="
+        r"[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\);"
+        r"[A-Za-z_$][\w$]*\(!1,"
+        r"(?P=route)\.value\.routeKind===`local-thread`\?"
+        r"(?P=route)\.value\.conversationId:null\)"
+    )
+
+    route_matches = list(route_pattern.finditer(nearby))
+
+    if len(route_matches) != 1:
+        raise RuntimeError(
+            "could not uniquely identify the native thread-summary route; "
+            f"found {len(route_matches)} candidates"
+        )
+
+    route_var = route_matches[0].group("route")
+
+    # Find the native Section component from the known Current task usage
+    # section immediately following this summary root.
+    section_context = thread_bundle[
+        summary_match.start():
+        min(len(thread_bundle), summary_match.end() + 8000)
+    ]
+
+    section_pattern = re.compile(
+        rf"\(0,{re.escape(jsx_alias)}\.jsx\)\("
+        r"(?P<section>[A-Za-z_$][\w$]*)\.Section,"
+        r"\{sectionKey:`usage`"
+    )
+
+    section_matches = list(section_pattern.finditer(section_context))
+
+    if len(section_matches) != 1:
+        raise RuntimeError(
+            "could not uniquely identify the native thread-summary "
+            f"Section component; found {len(section_matches)} candidates"
+        )
+
+    section_alias = section_matches[0].group("section")
+
+    thread_component = thread_component.replace(
+        "__CODEX_MUX_THREAD_JSX__",
+        jsx_alias,
+    )
+
+    thread_component = thread_component.replace(
+        "__CODEX_MUX_THREAD_SECTION__",
+        section_alias,
+    )
+
+    if (
+        "__CODEX_MUX_THREAD_JSX__" in thread_component
+        or "__CODEX_MUX_THREAD_SECTION__" in thread_component
+    ):
+        raise RuntimeError(
+            "thread component still contains unresolved native bindings"
+        )
+
+    thread_id_expr = (
+        f"{route_var}.value.routeKind===`local-thread`?"
+        f"{route_var}.value.conversationId:null"
+    )
+
     insertion = (
-        f"(0,{jsx_alias}.jsx)(CodexMuxThreadSubscription,{{}})"
+        f"(0,{jsx_alias}.jsx)"
+        f"(CodexMuxThreadSubscription,{{threadId:{thread_id_expr}}})"
     )
 
     new_items = (
@@ -1331,6 +1396,15 @@ def patch_renderer(extracted: Path, token: str) -> None:
         + summary_replacement
         + thread_bundle[summary_match.end():]
     )
+
+    # Prepend only after native offsets have been used for the structural
+    # replacement above.
+    if "function CodexMuxThreadSubscription(" in thread_bundle:
+        raise RuntimeError(
+            "thread bundle already contains CodexMuxThreadSubscription"
+        )
+
+    thread_bundle = thread_component + "\n" + thread_bundle
 
     thread_bundle_path.write_text(thread_bundle, encoding="utf-8")
 
@@ -1547,7 +1621,7 @@ def patch_app(
         run([str(asar), "extract", str(original_asar), str(extracted)])
         patch_asar_computer_use_identity(extracted)
         patch_desktop_profile(extracted, installed_computer_use_app)
-        patch_renderer(extracted, token)
+        patch_renderer(extracted, token, (source_version, source_build))
         sign_native_code_tree(extracted, signing_identity)
         repacked_asar = temporary_path / "app.asar"
         run(

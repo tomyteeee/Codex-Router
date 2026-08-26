@@ -44,65 +44,131 @@ type threadRecoveryData struct {
 	ModelProvider string
 }
 
-func (m *Multiplexer) accountQuotaBlocked(accountID string) bool {
+func (m *Multiplexer) accountQuotaBlocked(
+	accountID string,
+) bool {
+	return m.accountQuotaBlockedFor(
+		accountID,
+		quotaBucketNormal,
+	)
+}
+
+func (m *Multiplexer) accountQuotaBlockedFor(
+	accountID string,
+	bucket quotaBucket,
+) bool {
+	key := quotaBlockKey(accountID, bucket)
+
 	m.quotaMu.Lock()
 	defer m.quotaMu.Unlock()
 
-	until, ok := m.quotaBlocked[accountID]
+	until, ok := m.quotaBlocked[key]
 	if !ok {
 		return false
 	}
+
 	if !m.now().Before(until) {
-		delete(m.quotaBlocked, accountID)
+		delete(m.quotaBlocked, key)
 		return false
 	}
+
 	return true
 }
 
-func (m *Multiplexer) markAccountQuotaBlocked(accountID string) {
+func (m *Multiplexer) markAccountQuotaBlocked(
+	accountID string,
+) {
+	m.markAccountQuotaBlockedFor(
+		accountID,
+		quotaBucketNormal,
+	)
+}
+
+func (m *Multiplexer) markAccountQuotaBlockedFor(
+	accountID string,
+	bucket quotaBucket,
+) {
 	if accountID == "" {
 		return
 	}
+
+	key := quotaBlockKey(accountID, bucket)
 
 	now := m.now()
 	until := now.Add(quotaBlockFallback)
 
 	m.quotaMu.Lock()
-	if existing := m.quotaBlocked[accountID]; existing.After(until) {
+
+	if existing := m.quotaBlocked[key]; existing.After(until) {
 		until = existing
 	}
-	m.quotaBlocked[accountID] = until
+
+	m.quotaBlocked[key] = until
 	m.quotaMu.Unlock()
 
-	// Refine the temporary block to the server-provided reset time when
-	// possible. The short fallback prevents a stale successful snapshot from
-	// routing another turn straight back to an account that just rejected one.
+	// Refine the temporary block to the server-provided reset time for the
+	// exact allowance that failed.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			requestTimeout,
+		)
 		defer cancel()
 
-		snapshot, err := m.accountSnapshotWithProfile(ctx, accountID, false)
-		if err != nil || snapshot.RateLimits == nil {
+		snapshot, err := m.accountSnapshotWithProfile(
+			ctx,
+			accountID,
+			false,
+		)
+		if err != nil {
+			return
+		}
+
+		limits := rateLimitsForQuotaBucket(
+			snapshot,
+			bucket,
+		)
+		if limits == nil {
 			return
 		}
 
 		refined := until
-		for _, window := range rateLimitWindows(snapshot.RateLimits) {
-			if window == nil || window.UsedPercent < 100 || window.ResetsAt == nil {
+
+		for _, window := range rateLimitWindows(limits) {
+			if window == nil ||
+				window.UsedPercent < 100 ||
+				window.ResetsAt == nil {
 				continue
 			}
-			reset := time.Unix(*window.ResetsAt, 0)
+
+			reset := time.Unix(
+				*window.ResetsAt,
+				0,
+			)
+
 			if reset.After(refined) {
 				refined = reset
 			}
 		}
 
 		m.quotaMu.Lock()
-		if existing := m.quotaBlocked[accountID]; refined.After(existing) {
-			m.quotaBlocked[accountID] = refined
+
+		if existing := m.quotaBlocked[key]; refined.After(existing) {
+			m.quotaBlocked[key] = refined
 		}
+
 		m.quotaMu.Unlock()
 	}()
+}
+
+func (m *Multiplexer) markThreadQuotaBlocked(
+	accountID string,
+	threadID string,
+) {
+	m.markAccountQuotaBlockedFor(
+		accountID,
+		m.threadQuotaBucket(threadID, nil),
+	)
 }
 
 func (m *Multiplexer) recordThreadStarted(accountID string, params json.RawMessage) threadStartMeta {
@@ -754,7 +820,10 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 			if root == "" {
 				root = m.rootThreadID(threadID)
 			}
-			m.markAccountQuotaBlocked(inbound.AccountID)
+			m.markAccountQuotaBlockedFor(
+				inbound.AccountID,
+				m.threadQuotaBucket(quotaChild, nil),
+			)
 			go m.recoverThreadTree(
 				root,
 				inbound.AccountID,
@@ -768,7 +837,10 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 
 	if method == "thread/goal/updated" {
 		if limitedThread := parseUsageLimitedGoal(message.Params); limitedThread != "" {
-			m.markAccountQuotaBlocked(inbound.AccountID)
+			m.markAccountQuotaBlockedFor(
+				inbound.AccountID,
+				m.threadQuotaBucket(limitedThread, nil),
+			)
 			go m.recoverThreadTree(
 				m.rootThreadID(limitedThread),
 				inbound.AccountID,
@@ -783,7 +855,10 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 	if method == "error" {
 		errorThread, willRetry, limited := parseErrorNotification(message.Params)
 		if limited {
-			m.markAccountQuotaBlocked(inbound.AccountID)
+			m.markAccountQuotaBlockedFor(
+				inbound.AccountID,
+				m.threadQuotaBucket(errorThread, nil),
+			)
 			if !willRetry && errorThread != "" {
 				go m.recoverThreadTree(
 					m.rootThreadID(errorThread),
@@ -809,7 +884,10 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 			}
 
 			if explicitLimit {
-				m.markAccountQuotaBlocked(inbound.AccountID)
+				m.markAccountQuotaBlockedFor(
+					inbound.AccountID,
+					m.threadQuotaBucket(completedThread, nil),
+				)
 				go m.recoverThreadTree(
 					root,
 					inbound.AccountID,
@@ -850,28 +928,55 @@ func (m *Multiplexer) threadTreeRecovering(root string) bool {
 	return ok && (active.recovering || active.parked)
 }
 
-func (m *Multiplexer) verifySilentCompletionAndRecover(inbound backend.Inbound, root string) {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	snapshot, err := m.accountSnapshotWithProfile(ctx, inbound.AccountID, false)
+func (m *Multiplexer) verifySilentCompletionAndRecover(
+	inbound backend.Inbound,
+	root string,
+) {
+	threadID := threadIDFromInboundNotification(
+		inbound.Message.Method,
+		inbound.Message.Params,
+	)
+	bucket := m.threadQuotaBucket(threadID, nil)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		requestTimeout,
+	)
+	snapshot, err := m.accountSnapshotWithProfile(
+		ctx,
+		inbound.AccountID,
+		false,
+	)
 	cancel()
 
-	if err == nil && rateLimitsHaveCapacity(snapshot.RateLimits) && !m.accountQuotaBlocked(inbound.AccountID) {
-		threadID := threadIDFromInboundNotification(inbound.Message.Method, inbound.Message.Params)
-		m.clearActiveTurn(threadID, inbound.AccountID)
+	if err == nil &&
+		rateLimitsHaveCapacity(
+			rateLimitsForQuotaBucket(snapshot, bucket),
+		) &&
+		!m.accountQuotaBlockedFor(inbound.AccountID, bucket) {
+		m.clearActiveTurn(
+			threadID,
+			inbound.AccountID,
+		)
 		m.writeRaw(inbound.Raw)
 		return
 	}
 
 	if err != nil {
-		// Unknown is not proof of quota exhaustion. Preserve the real terminal
-		// event instead of manufacturing a failover.
-		threadID := threadIDFromInboundNotification(inbound.Message.Method, inbound.Message.Params)
-		m.clearActiveTurn(threadID, inbound.AccountID)
+		// Unknown is not proof of quota exhaustion.
+		m.clearActiveTurn(
+			threadID,
+			inbound.AccountID,
+		)
 		m.writeRaw(inbound.Raw)
 		return
 	}
 
-	m.markAccountQuotaBlocked(inbound.AccountID)
+	m.markAccountQuotaBlockedFor(
+		inbound.AccountID,
+		bucket,
+	)
+
 	m.recoverThreadTree(
 		root,
 		inbound.AccountID,
@@ -904,39 +1009,84 @@ func (m *Multiplexer) recoveryWatchLoop(ctx context.Context) {
 
 func (m *Multiplexer) recoverStalledQuotaTurns() {
 	now := m.now()
+
 	type candidate struct {
 		threadID  string
 		accountID string
+		bucket    quotaBucket
 	}
+
 	roots := make(map[string]candidate)
 
 	m.activeTurnMu.Lock()
+
 	for threadID, active := range m.activeTurns {
-		if active.recovering || active.parked || active.accountID == "" {
+		if active.recovering ||
+			active.parked ||
+			active.accountID == "" {
 			continue
 		}
-		if active.lastActivity.IsZero() || now.Sub(active.lastActivity) < recoveryStallThreshold {
+
+		if active.lastActivity.IsZero() ||
+			now.Sub(active.lastActivity) <
+				recoveryStallThreshold {
 			continue
 		}
+
 		root := m.rootThreadID(threadID)
 		if root == "" {
 			root = threadID
 		}
-		roots[root] = candidate{threadID: root, accountID: active.accountID}
+
+		bucket := m.threadQuotaBucket(
+			threadID,
+			active.params,
+		)
+
+		roots[root] = candidate{
+			threadID:  root,
+			accountID: active.accountID,
+			bucket:    bucket,
+		}
 	}
+
 	m.activeTurnMu.Unlock()
 
 	for _, entry := range roots {
-		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-		snapshot, err := m.accountSnapshotWithProfile(ctx, entry.accountID, false)
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			requestTimeout,
+		)
+
+		snapshot, err := m.accountSnapshotWithProfile(
+			ctx,
+			entry.accountID,
+			false,
+		)
 		cancel()
+
 		if err != nil {
 			continue
 		}
-		if rateLimitsHaveCapacity(snapshot.RateLimits) && !m.accountQuotaBlocked(entry.accountID) {
+
+		limits := rateLimitsForQuotaBucket(
+			snapshot,
+			entry.bucket,
+		)
+
+		if rateLimitsHaveCapacity(limits) &&
+			!m.accountQuotaBlockedFor(
+				entry.accountID,
+				entry.bucket,
+			) {
 			continue
 		}
-		m.markAccountQuotaBlocked(entry.accountID)
+
+		m.markAccountQuotaBlockedFor(
+			entry.accountID,
+			entry.bucket,
+		)
+
 		go m.recoverThreadTree(
 			entry.threadID,
 			entry.accountID,
@@ -967,8 +1117,16 @@ func (m *Multiplexer) recoverThreadTree(
 		return
 	}
 
+	bucket := m.threadQuotaBucket(
+		root,
+		active.params,
+	)
+
 	if quota {
-		m.markAccountQuotaBlocked(sourceAccountID)
+		m.markAccountQuotaBlockedFor(
+			sourceAccountID,
+			bucket,
+		)
 	}
 	m.markTreeSourceStale(root, sourceAccountID)
 
@@ -1088,9 +1246,18 @@ func (m *Multiplexer) performThreadRecovery(
 		tried = make(map[string]struct{})
 	}
 
+	bucket := m.threadQuotaBucket(
+		root,
+		active.params,
+	)
+
 	var candidates []state.Account
 	if preferSource {
-		if source, ok := m.store.Account(sourceAccountID); ok && source.Enabled && !m.accountQuotaBlocked(sourceAccountID) {
+		if source, ok := m.store.Account(sourceAccountID); ok && source.Enabled &&
+			!m.accountQuotaBlockedFor(
+				sourceAccountID,
+				bucket,
+			) {
 			candidates = append(candidates, source)
 		}
 	}
@@ -1106,7 +1273,11 @@ func (m *Multiplexer) performThreadRecovery(
 			}
 		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-			fallback, _, err := m.chooseAccountExcluding(ctx, tried)
+			fallback, _, err := m.chooseAccountForQuotaBucket(
+				ctx,
+				tried,
+				bucket,
+			)
 			cancel()
 			if err != nil {
 				return err
@@ -1169,7 +1340,10 @@ func (m *Multiplexer) performThreadRecovery(
 
 		if startErr != nil {
 			if usageLimitText(startErr.Error()) {
-				m.markAccountQuotaBlocked(target.ID)
+				m.markAccountQuotaBlockedFor(
+					target.ID,
+					bucket,
+				)
 			}
 			fmt.Fprintf(
 				os.Stderr,
@@ -1237,13 +1411,28 @@ func (m *Multiplexer) robustFailoverTurn(
 	}
 	tried[sourceAccountID] = struct{}{}
 
+	bucket := m.threadQuotaBucket(
+		threadID,
+		message.Params,
+	)
+
 	for attempts := 0; attempts < len(m.store.Accounts())+1; attempts++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-		fallback, _, err := m.chooseAccountExcluding(ctx, tried)
+		fallback, _, err := m.chooseAccountForQuotaBucket(
+			ctx,
+			tried,
+			bucket,
+		)
 		cancel()
 		if err != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-			m.write(m.allSubscriptionsDepleted(ctx, message.ID))
+			m.write(
+				m.allSubscriptionsDepletedForQuotaBucket(
+					ctx,
+					message.ID,
+					bucket,
+				),
+			)
 			cancel()
 			return
 		}
@@ -1292,12 +1481,32 @@ func (m *Multiplexer) retryTurnAfterUsageLimitRobust(
 	route externalRoute,
 	exhaustedAccountID string,
 ) {
-	m.markAccountQuotaBlocked(exhaustedAccountID)
-
 	threadID := threadIDFromParams(route.message.Params)
+
+	bucket := m.threadQuotaBucket(
+		threadID,
+		route.message.Params,
+	)
+
+	m.markAccountQuotaBlockedFor(
+		exhaustedAccountID,
+		bucket,
+	)
+
 	if threadID == "" {
-		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-		m.write(m.allSubscriptionsDepleted(ctx, route.message.ID))
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			requestTimeout,
+		)
+
+		m.write(
+			m.allSubscriptionsDepletedForQuotaBucket(
+				ctx,
+				route.message.ID,
+				bucket,
+			),
+		)
+
 		cancel()
 		return
 	}
@@ -1306,8 +1515,15 @@ func (m *Multiplexer) retryTurnAfterUsageLimitRobust(
 	if excluded == nil {
 		excluded = make(map[string]struct{})
 	}
+
 	excluded[exhaustedAccountID] = struct{}{}
-	m.robustFailoverTurn(route.message, threadID, exhaustedAccountID, excluded)
+
+	m.robustFailoverTurn(
+		route.message,
+		threadID,
+		exhaustedAccountID,
+		excluded,
+	)
 }
 
 func stableReadFile(path string) ([]byte, error) {
