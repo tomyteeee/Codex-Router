@@ -38,16 +38,17 @@ type externalRoute struct {
 }
 
 type activeTurn struct {
-	accountID     string
-	turnID        string
-	params        json.RawMessage
-	excluded      map[string]struct{}
-	generation    uint64
-	lastActivity  time.Time
-	recovering    bool
-	parked        bool
-	recoveryCause string
-	failureRaw    []byte
+	accountID            string
+	turnID               string
+	params               json.RawMessage
+	excluded             map[string]struct{}
+	generation           uint64
+	lastActivity         time.Time
+	recovering           bool
+	parked               bool
+	recoveryCause        string
+	failureRaw           []byte
+	agentMessageComplete bool
 }
 
 type quotaBucket string
@@ -135,6 +136,95 @@ func rateLimitsForQuotaBucket(
 	}
 
 	return snapshot.RateLimits
+}
+
+func paramsForQuotaBucket(
+	params json.RawMessage,
+	bucket quotaBucket,
+) (json.RawMessage, error) {
+	if bucket != quotaBucketReserve {
+		return append(json.RawMessage(nil), params...), nil
+	}
+
+	decoded := make(map[string]json.RawMessage)
+
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &decoded); err != nil {
+			return nil, fmt.Errorf(
+				"decode turn params for Reserve fallback: %w",
+				err,
+			)
+		}
+	}
+
+	if decoded == nil {
+		decoded = make(map[string]json.RawMessage)
+	}
+
+	model, err := json.Marshal("gpt-reserve")
+	if err != nil {
+		return nil, err
+	}
+
+	decoded["model"] = model
+
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"encode Reserve fallback params: %w",
+			err,
+		)
+	}
+
+	return encoded, nil
+}
+
+func (m *Multiplexer) chooseAccountWithReserveFallback(
+	ctx context.Context,
+	excluded map[string]struct{},
+	bucket quotaBucket,
+) (
+	state.Account,
+	RouteReason,
+	quotaBucket,
+	error,
+) {
+	account, reason, err := m.chooseAccountForQuotaBucket(
+		ctx,
+		excluded,
+		bucket,
+	)
+
+	if err == nil {
+		return account, reason, bucket, nil
+	}
+
+	if bucket != quotaBucketNormal ||
+		!errors.Is(err, errNoSubscriptionCapacity) {
+		return state.Account{}, reason, bucket, err
+	}
+
+	// Normal quota exclusions must not leak into the separately metered
+	// Reserve pool. In particular, an account whose 5h or weekly normal
+	// allowance is exhausted may still have completely usable Reserve.
+	reserveAccount, reserveReason, reserveErr :=
+		m.chooseAccountForQuotaBucket(
+			ctx,
+			nil,
+			quotaBucketReserve,
+		)
+
+	if reserveErr != nil {
+		return state.Account{},
+			reserveReason,
+			quotaBucketReserve,
+			reserveErr
+	}
+
+	return reserveAccount,
+		reserveReason,
+		quotaBucketReserve,
+		nil
 }
 
 func quotaBlockKey(
@@ -484,32 +574,76 @@ func (m *Multiplexer) handleClientNotification(message protocol.Message) {
 }
 
 func (m *Multiplexer) routeNewThread(message protocol.Message) {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	defer cancel()
-	bucket := quotaBucketFromParams(message.Params)
-	account, reason, err := m.chooseAccountForQuotaBucket(
-		ctx,
-		nil,
-		bucket,
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		2*requestTimeout,
 	)
+	defer cancel()
+
+	bucket := quotaBucketFromParams(message.Params)
+
+	account, reason, selectedBucket, err :=
+		m.chooseAccountWithReserveFallback(
+			ctx,
+			nil,
+			bucket,
+		)
+
 	if err != nil {
 		if errors.Is(err, errNoSubscriptionCapacity) {
 			m.write(
 				m.allSubscriptionsDepletedForQuotaBucket(
 					ctx,
 					message.ID,
-					bucket,
+					selectedBucket,
 				),
 			)
 			return
 		}
-		m.write(protocol.Failure(message.ID, -32020, err.Error()))
+
+		m.write(
+			protocol.Failure(
+				message.ID,
+				-32020,
+				err.Error(),
+			),
+		)
 		return
 	}
+
+	if selectedBucket != bucket {
+		updatedParams, updateErr :=
+			paramsForQuotaBucket(
+				message.Params,
+				selectedBucket,
+			)
+
+		if updateErr != nil {
+			m.write(
+				protocol.Failure(
+					message.ID,
+					-32020,
+					updateErr.Error(),
+				),
+			)
+			return
+		}
+
+		message.Params = updatedParams
+		bucket = selectedBucket
+	}
+
 	if err := m.forward(account.ID, message); err != nil {
-		m.write(protocol.Failure(message.ID, -32021, err.Error()))
+		m.write(
+			protocol.Failure(
+				message.ID,
+				-32021,
+				err.Error(),
+			),
+		)
 		return
 	}
+
 	m.publish(Event{
 		Type:      "thread-routed",
 		AccountID: account.ID,
@@ -625,6 +759,7 @@ func (m *Multiplexer) rememberActiveTurn(
 	active.parked = false
 	active.failureRaw = nil
 	active.recoveryCause = ""
+	active.agentMessageComplete = false
 	m.activeTurns[threadID] = active
 	m.activeTurnMu.Unlock()
 }
@@ -891,6 +1026,11 @@ func (m *Multiplexer) resumeThreadOnAccount(
 	sourceAccountID string,
 	targetAccountID string,
 ) error {
+	if sourceAccountID != "" &&
+		sourceAccountID == targetAccountID {
+		return nil
+	}
+
 	return m.robustResumeThreadOnAccount(
 		ctx,
 		threadID,
@@ -1081,6 +1221,18 @@ func (m *Multiplexer) handleTrackedTurnCompleted(
 		return
 	}
 
+	// A completed agentMessage is real terminal output. Explicit structured
+	// quota failures above still recover, but an empty completion must not
+	// resurrect a task that already produced a legitimate final response.
+	if active.agentMessageComplete {
+		m.clearActiveTurn(
+			threadID,
+			inbound.AccountID,
+		)
+		m.writeRaw(raw)
+		return
+	}
+
 	silentThreadID, suspicious :=
 		silentCompletedTurn(inbound.Message.Params)
 
@@ -1190,7 +1342,7 @@ func (m *Multiplexer) continueAutonomousTurnAfterUsageLimit(
 			2*requestTimeout,
 		)
 
-		fallback, _, err := m.chooseAccountForQuotaBucket(
+		fallback, _, selectedBucket, err := m.chooseAccountWithReserveFallback(
 			ctx,
 			excluded,
 			bucket,
@@ -1211,6 +1363,39 @@ func (m *Multiplexer) continueAutonomousTurnAfterUsageLimit(
 			})
 
 			return
+		}
+		if selectedBucket != bucket {
+			bucket = selectedBucket
+
+			// Exclusions accumulated while exhausting normal quota are not valid
+			// for the independent Reserve allowance.
+			excluded = make(map[string]struct{})
+
+			updatedParams, paramErr := paramsForQuotaBucket(
+				active.params,
+				bucket,
+			)
+			if paramErr != nil {
+				cancel()
+
+				m.clearActiveTurn(threadID, "")
+				m.writeRaw(failedNotification)
+
+				fmt.Fprintf(
+					os.Stderr,
+					"codex-mux: could not switch autonomous turn %s to Luna Reserve: %v\n",
+					threadID,
+					paramErr,
+				)
+
+				return
+			}
+
+			active.params = updatedParams
+			m.rememberThreadQuotaBucket(
+				threadID,
+				bucket,
+			)
 		}
 
 		targetAccountID := fallback.ID
@@ -1277,15 +1462,23 @@ func (m *Multiplexer) continueAutonomousTurnAfterUsageLimit(
 
 		// Install state before starting the turn so even a very fast
 		// usage-limit failure can be associated with this continuation.
+		//
+		// IMPORTANT: keep active.params as the durable task. The synthetic
+		// continuation prompt is transport for THIS recovery only and must
+		// never become the task that future recoveries retry.
 		m.activeTurnMu.Lock()
-		m.activeTurns[threadID] = activeTurn{
-			accountID: targetAccountID,
-			params: append(
-				json.RawMessage(nil),
-				continuationParams...,
-			),
-			excluded: cloneAccountSet(excluded),
-		}
+		nextActive := active
+		nextActive.accountID = targetAccountID
+		nextActive.params = append(
+			json.RawMessage(nil),
+			active.params...,
+		)
+		nextActive.excluded = cloneAccountSet(excluded)
+		nextActive.agentMessageComplete = false
+		nextActive.recovering = false
+		nextActive.parked = false
+		nextActive.lastActivity = m.now()
+		m.activeTurns[threadID] = nextActive
 		m.activeTurnMu.Unlock()
 
 		_, err = target.Request(
@@ -1590,14 +1783,43 @@ func accountHasCapacityForQuotaBucket(
 }
 
 func usageLimitText(text string) bool {
-	text = strings.ToLower(text)
+	text = strings.ToLower(
+		strings.TrimSpace(text),
+	)
 
-	return strings.Contains(text, "usagelimitexceeded") ||
-		strings.Contains(text, "usage_limit") ||
-		strings.Contains(text, "usage limit") ||
-		strings.Contains(text, "rate_limit") ||
-		strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "quota")
+	signals := []string{
+		"usagelimitexceeded",
+		"usage_limit_exceeded",
+		"usage-limit-exceeded",
+		"usage limit exceeded",
+		"usage limit reached",
+		"reached your usage limit",
+		"hit your usage limit",
+		"you've reached your usage limit",
+		"you have reached your usage limit",
+
+		"rate_limit_exceeded",
+		"rate-limit-exceeded",
+		"rate limit exceeded",
+		"rate limit reached",
+		"too many requests",
+
+		"quota_exceeded",
+		"quota exceeded",
+		"insufficient_quota",
+		"insufficient quota",
+
+		`"usage_limit"`,
+		`"rate_limit"`,
+	}
+
+	for _, signal := range signals {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func usageLimitNotification(params json.RawMessage) bool {

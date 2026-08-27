@@ -253,3 +253,88 @@ func TestQuotaBlockKeysSeparateNormalAndReserve(t *testing.T) {
 		)
 	}
 }
+
+func TestNormalCapacityRequiresEveryWindowAvailable(t *testing.T) {
+	short := int64(300)
+	weekly := int64(10080)
+
+	tests := []struct {
+		name   string
+		short  float64
+		weekly float64
+		want   bool
+	}{
+		{
+			name:   "short empty weekly exhausted",
+			short:  0,
+			weekly: 100,
+			want:   false,
+		},
+		{
+			name:   "short exhausted weekly empty",
+			short:  100,
+			weekly: 0,
+			want:   false,
+		},
+		{
+			name:   "both exhausted",
+			short:  100,
+			weekly: 100,
+			want:   false,
+		},
+		{
+			name:   "both still usable",
+			short:  99,
+			weekly: 99,
+			want:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			limits := &RateLimits{
+				Primary: &RateLimitWindow{
+					UsedPercent:        tc.short,
+					WindowDurationMins: &short,
+				},
+				Secondary: &RateLimitWindow{
+					UsedPercent:        tc.weekly,
+					WindowDurationMins: &weekly,
+				},
+			}
+
+			if got := rateLimitsHaveCapacity(limits); got != tc.want {
+				t.Fatalf(
+					"rateLimitsHaveCapacity() = %v, want %v for short=%v weekly=%v",
+					got,
+					tc.want,
+					tc.short,
+					tc.weekly,
+				)
+			}
+		})
+	}
+}
+
+func TestParamsForQuotaBucketForcesReserveModel(t *testing.T) {
+	params, err := paramsForQuotaBucket(
+		[]byte(`{
+			"threadId":"thread-1",
+			"model":"gpt-5.4",
+			"effort":"high"
+		}`),
+		quotaBucketReserve,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := quotaBucketFromParams(params); got != quotaBucketReserve {
+		t.Fatalf(
+			"Reserve fallback params selected %q, want %q: %s",
+			got,
+			quotaBucketReserve,
+			string(params),
+		)
+	}
+}

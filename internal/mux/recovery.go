@@ -26,6 +26,7 @@ const (
 	recoveryRetryInterval   = 30 * time.Second
 	recoveryInterruptWindow = 2 * time.Second
 	recoveryFlushDelay      = 250 * time.Millisecond
+	recoveryCompletionGrace = 250 * time.Millisecond
 )
 
 type threadStartMeta struct {
@@ -691,6 +692,92 @@ func (m *Multiplexer) bestEffortInterruptTree(root, sourceAccountID string) {
 	}
 }
 
+func itemNotificationHasAgentMessage(
+	params json.RawMessage,
+) bool {
+	var decoded struct {
+		Item struct {
+			Type    string          `json:"type"`
+			Text    string          `json:"text"`
+			Content json.RawMessage `json:"content"`
+		} `json:"item"`
+	}
+
+	if json.Unmarshal(params, &decoded) != nil {
+		return false
+	}
+
+	if !strings.EqualFold(
+		strings.TrimSpace(decoded.Item.Type),
+		"agentMessage",
+	) {
+		return false
+	}
+
+	if strings.TrimSpace(decoded.Item.Text) != "" {
+		return true
+	}
+
+	content := strings.TrimSpace(
+		string(decoded.Item.Content),
+	)
+
+	return content != "" &&
+		content != "null" &&
+		content != "[]" &&
+		content != "{}"
+}
+
+func (m *Multiplexer) setAgentMessageComplete(
+	threadID string,
+	accountID string,
+	complete bool,
+) {
+	if threadID == "" {
+		return
+	}
+
+	root := m.rootThreadID(threadID)
+
+	ids := []string{threadID}
+	if root != "" && root != threadID {
+		ids = append(ids, root)
+	}
+
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	for _, id := range ids {
+		active, ok := m.activeTurns[id]
+		if !ok {
+			continue
+		}
+
+		// During recovery the target may emit notifications before ownership
+		// is committed. Allow that race, but normally require the current
+		// account to match.
+		if accountID != "" &&
+			active.accountID != "" &&
+			active.accountID != accountID &&
+			!active.recovering {
+			continue
+		}
+
+		active.agentMessageComplete = complete
+		m.activeTurns[id] = active
+	}
+}
+
+func silentCompletionNeedsQuotaVerification(
+	active activeTurn,
+	params json.RawMessage,
+) bool {
+	_, suspicious := silentCompletedTurn(params)
+
+	return suspicious &&
+		!active.agentMessageComplete
+}
+
 func parseCollabItem(params json.RawMessage) (sender string, receivers []string, quotaChild string) {
 	var decoded struct {
 		Item struct {
@@ -744,10 +831,57 @@ func parseErrorNotification(params json.RawMessage) (threadID string, willRetry 
 		WillRetry bool            `json:"willRetry"`
 		Error     json.RawMessage `json:"error"`
 	}
+
 	if json.Unmarshal(params, &decoded) != nil {
 		return "", false, false
 	}
-	return decoded.ThreadID, decoded.WillRetry, usageLimitText(string(decoded.Error))
+
+	// Strong quota signatures are safe everywhere.
+	if usageLimitText(string(decoded.Error)) {
+		return decoded.ThreadID, decoded.WillRetry, true
+	}
+
+	// This is a structured app-server error channel, so preserve support for
+	// legacy short quota messages without making the global text classifier
+	// broad enough to mistake ordinary conversation/debug prose for quota.
+	var quotaError struct {
+		Message        string          `json:"message"`
+		CodexErrorInfo json.RawMessage `json:"codexErrorInfo"`
+		Code           string          `json:"code"`
+		Type           string          `json:"type"`
+	}
+
+	if json.Unmarshal(decoded.Error, &quotaError) != nil {
+		return decoded.ThreadID, decoded.WillRetry, false
+	}
+
+	var codexErrorInfo string
+	_ = json.Unmarshal(
+		quotaError.CodexErrorInfo,
+		&codexErrorInfo,
+	)
+
+	if codexErrorInfo == "usageLimitExceeded" {
+		return decoded.ThreadID, decoded.WillRetry, true
+	}
+
+	for _, value := range []string{
+		quotaError.Code,
+		quotaError.Type,
+	} {
+		if usageLimitText(value) {
+			return decoded.ThreadID, decoded.WillRetry, true
+		}
+	}
+
+	switch strings.ToLower(strings.TrimSpace(quotaError.Message)) {
+	case "rate limit",
+		"usage limit",
+		"quota":
+		return decoded.ThreadID, decoded.WillRetry, true
+	}
+
+	return decoded.ThreadID, decoded.WillRetry, false
 }
 
 func parseUsageLimitedGoal(params json.RawMessage) string {
@@ -812,6 +946,24 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 	threadID := threadIDFromInboundNotification(method, message.Params)
 	if threadID != "" {
 		m.touchThread(threadID, inbound.AccountID)
+	}
+
+	if method == "item/started" && threadID != "" {
+		m.setAgentMessageComplete(
+			threadID,
+			inbound.AccountID,
+			false,
+		)
+	}
+
+	if method == "item/completed" &&
+		threadID != "" &&
+		itemNotificationHasAgentMessage(message.Params) {
+		m.setAgentMessageComplete(
+			threadID,
+			inbound.AccountID,
+			true,
+		)
 	}
 
 	if method == "item/started" || method == "item/completed" {
@@ -898,11 +1050,19 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 				return true
 			}
 
-			if _, suspicious := silentCompletedTurn(message.Params); suspicious {
-				if _, tracked := m.activeTurnFor(completedThread, inbound.AccountID); tracked {
-					go m.verifySilentCompletionAndRecover(inbound, root)
-					return true
-				}
+			if active, tracked := m.activeTurnFor(
+				completedThread,
+				inbound.AccountID,
+			); tracked &&
+				silentCompletionNeedsQuotaVerification(
+					active,
+					message.Params,
+				) {
+				go m.verifySilentCompletionAndRecover(
+					inbound,
+					root,
+				)
+				return true
 			}
 
 			// A terminal notification emitted by the old source while recovery is
@@ -936,24 +1096,60 @@ func (m *Multiplexer) verifySilentCompletionAndRecover(
 		inbound.Message.Method,
 		inbound.Message.Params,
 	)
-	bucket := m.threadQuotaBucket(threadID, nil)
+
+	// Give a separately emitted item/completed agentMessage a small chance
+	// to arrive before interpreting an empty turn/completed as quota loss.
+	time.Sleep(recoveryCompletionGrace)
+
+	active, ok := m.activeTurnFor(
+		threadID,
+		inbound.AccountID,
+	)
+
+	if !ok {
+		// The turn was already finalized elsewhere. Never resurrect it.
+		m.writeRaw(inbound.Raw)
+		return
+	}
+
+	if active.agentMessageComplete {
+		m.clearCompletedThreadTree(
+			threadID,
+			inbound.AccountID,
+		)
+		m.writeRaw(inbound.Raw)
+		return
+	}
+
+	bucket := m.threadQuotaBucket(
+		threadID,
+		active.params,
+	)
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		requestTimeout,
 	)
+
 	snapshot, err := m.accountSnapshotWithProfile(
 		ctx,
 		inbound.AccountID,
 		false,
 	)
+
 	cancel()
 
 	if err == nil &&
 		rateLimitsHaveCapacity(
-			rateLimitsForQuotaBucket(snapshot, bucket),
+			rateLimitsForQuotaBucket(
+				snapshot,
+				bucket,
+			),
 		) &&
-		!m.accountQuotaBlockedFor(inbound.AccountID, bucket) {
+		!m.accountQuotaBlockedFor(
+			inbound.AccountID,
+			bucket,
+		) {
 		m.clearActiveTurn(
 			threadID,
 			inbound.AccountID,
@@ -1023,6 +1219,7 @@ func (m *Multiplexer) recoverStalledQuotaTurns() {
 	for threadID, active := range m.activeTurns {
 		if active.recovering ||
 			active.parked ||
+			active.agentMessageComplete ||
 			active.accountID == "" {
 			continue
 		}
@@ -1273,7 +1470,7 @@ func (m *Multiplexer) performThreadRecovery(
 			}
 		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-			fallback, _, err := m.chooseAccountForQuotaBucket(
+			fallback, _, selectedBucket, err := m.chooseAccountWithReserveFallback(
 				ctx,
 				tried,
 				bucket,
@@ -1282,6 +1479,32 @@ func (m *Multiplexer) performThreadRecovery(
 			if err != nil {
 				return err
 			}
+			if selectedBucket != bucket {
+				bucket = selectedBucket
+
+				// Start a fresh candidate set for the independently metered Reserve
+				// allowance.
+				tried = make(map[string]struct{})
+
+				updatedParams, paramErr := paramsForQuotaBucket(
+					active.params,
+					bucket,
+				)
+				if paramErr != nil {
+					return fmt.Errorf(
+						"switch recovery to Luna Reserve: %w",
+						paramErr,
+					)
+				}
+
+				active.params = updatedParams
+
+				m.rememberThreadQuotaBucket(
+					root,
+					bucket,
+				)
+			}
+
 			target = fallback
 		}
 
@@ -1314,6 +1537,15 @@ func (m *Multiplexer) performThreadRecovery(
 		if !ok {
 			continue
 		}
+
+		// A genuine new recovery turn is about to start.
+		// Clear terminal-output state BEFORE Request so a fast target response
+		// can safely set it again.
+		m.activeTurnMu.Lock()
+		current := m.activeTurns[root]
+		current.agentMessageComplete = false
+		m.activeTurns[root] = current
+		m.activeTurnMu.Unlock()
 
 		ctx, cancel = context.WithTimeout(context.Background(), 2*requestTimeout)
 		response, startErr := targetChild.Request(ctx, "turn/start", params)
@@ -1360,7 +1592,16 @@ func (m *Multiplexer) performThreadRecovery(
 			return err
 		}
 
-		m.setRecoverySucceeded(root, target.ID, turnID, params, nil)
+		// Keep the original durable task/model state. `params` contains the
+		// synthetic "Continue the interrupted task..." input and must never
+		// become the next recovery's source task.
+		m.setRecoverySucceeded(
+			root,
+			target.ID,
+			turnID,
+			active.params,
+			nil,
+		)
 		m.clearStaleSource(root, target.ID)
 
 		m.publish(Event{
@@ -1418,12 +1659,17 @@ func (m *Multiplexer) robustFailoverTurn(
 
 	for attempts := 0; attempts < len(m.store.Accounts())+1; attempts++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-		fallback, _, err := m.chooseAccountForQuotaBucket(
+		fallback, _, selectedBucket, err := m.chooseAccountWithReserveFallback(
 			ctx,
 			tried,
 			bucket,
 		)
 		cancel()
+		if selectedBucket != bucket && err != nil {
+			// If both normal and Reserve are exhausted, report depletion using the
+			// final quota domain that was actually checked.
+			bucket = selectedBucket
+		}
 		if err != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 			m.write(
@@ -1435,6 +1681,35 @@ func (m *Multiplexer) robustFailoverTurn(
 			)
 			cancel()
 			return
+		}
+		if selectedBucket != bucket {
+			bucket = selectedBucket
+
+			// Normal exhaustion must never blacklist the same account's Reserve
+			// allowance.
+			tried = make(map[string]struct{})
+
+			updatedParams, paramErr := paramsForQuotaBucket(
+				message.Params,
+				bucket,
+			)
+			if paramErr != nil {
+				m.write(
+					protocol.Failure(
+						message.ID,
+						-32027,
+						paramErr.Error(),
+					),
+				)
+				return
+			}
+
+			message.Params = updatedParams
+
+			m.rememberThreadQuotaBucket(
+				threadID,
+				bucket,
+			)
 		}
 
 		tried[fallback.ID] = struct{}{}
@@ -1795,7 +2070,8 @@ func (m *Multiplexer) handleChildExit(accountID, detail string) {
 	seen := make(map[string]struct{})
 	m.activeTurnMu.Lock()
 	for threadID, active := range m.activeTurns {
-		if active.accountID != accountID {
+		if active.accountID != accountID ||
+			active.agentMessageComplete {
 			continue
 		}
 		root := m.rootThreadID(threadID)
