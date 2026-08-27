@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/b-nnett/codex-subscription-router/internal/protocol"
+	"github.com/tomyteeee/Codex-Router/internal/protocol"
 )
 
 func TestIsUsageLimitResponseRecognizesStructuredError(t *testing.T) {

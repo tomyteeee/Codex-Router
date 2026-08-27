@@ -15,9 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/b-nnett/codex-subscription-router/internal/backend"
-	"github.com/b-nnett/codex-subscription-router/internal/protocol"
-	"github.com/b-nnett/codex-subscription-router/internal/state"
+	"github.com/tomyteeee/Codex-Router/internal/backend"
+	"github.com/tomyteeee/Codex-Router/internal/protocol"
+	"github.com/tomyteeee/Codex-Router/internal/state"
 )
 
 const requestTimeout = 30 * time.Second
@@ -365,6 +365,10 @@ type Multiplexer struct {
 	quotaMu      sync.Mutex
 	quotaBlocked map[string]time.Time
 
+	initialQuotaWarmupOnce sync.Once
+	initialQuotaWarmupDone chan struct{}
+	initialQuotaKnown      map[string]struct{}
+
 	threadQuotaMu      sync.RWMutex
 	threadQuotaBuckets map[string]quotaBucket
 
@@ -383,9 +387,21 @@ type Multiplexer struct {
 	serverRoutes   map[string]serverRequestRoute
 	serverSequence atomic.Uint64
 
-	outputMu sync.Mutex
-	eventsMu sync.RWMutex
-	events   map[chan Event]struct{}
+	// outputMu serializes queue insertion. The dedicated outputLoop is
+	// the only goroutine that performs potentially blocking renderer writes.
+	outputMu      sync.Mutex
+	outputQueue   chan []byte
+	outputStarted atomic.Bool
+
+	// account/rateLimits/updated can be emitted by every child at roughly
+	// the same time. Coalesce those notifications so one burst does not
+	// trigger N complete multi-account snapshot passes.
+	rateLimitNotifyMu       sync.Mutex
+	rateLimitNotifyRunning  bool
+	rateLimitNotifyPending  bool
+	rateLimitNotifyFallback []byte
+	eventsMu                sync.RWMutex
+	events                  map[chan Event]struct{}
 
 	profileMu     sync.Mutex
 	profileClient *http.Client
@@ -408,28 +424,31 @@ func New(options Options) (*Multiplexer, error) {
 		return nil, errors.New("real executable, store, and output are required")
 	}
 	return &Multiplexer{
-		realExecutable:       options.RealExecutable,
-		realArgs:             append([]string(nil), options.RealArgs...),
-		environment:          append([]string(nil), options.Environment...),
-		store:                options.Store,
-		output:               options.Output,
-		children:             make(map[string]*backend.Child),
-		inbound:              make(chan backend.Inbound, 1024),
-		externalRoutes:       make(map[string]externalRoute),
-		activeTurns:          make(map[string]activeTurn),
-		quotaBlocked:         make(map[string]time.Time),
-		threadQuotaBuckets:   make(map[string]quotaBucket),
-		threadParents:        make(map[string]string),
-		staleSources:         make(map[string]map[string]struct{}),
-		commandPIDs:          make(map[string]map[int]string),
-		serverRoutes:         make(map[string]serverRequestRoute),
-		events:               make(map[chan Event]struct{}),
-		profileClient:        &http.Client{Timeout: 10 * time.Second},
-		profileCache:         make(map[string]profileCacheEntry),
-		now:                  time.Now,
-		resetCreditsCache:    make(map[string]resetCreditsCacheEntry),
-		resetCreditsEndpoint: rateLimitResetCreditsURL,
-		resetPreviews:        make(map[string]ResetCreditsPreview),
+		realExecutable:         options.RealExecutable,
+		realArgs:               append([]string(nil), options.RealArgs...),
+		environment:            append([]string(nil), options.Environment...),
+		store:                  options.Store,
+		output:                 options.Output,
+		children:               make(map[string]*backend.Child),
+		inbound:                make(chan backend.Inbound, 1024),
+		outputQueue:            make(chan []byte, 4096),
+		externalRoutes:         make(map[string]externalRoute),
+		activeTurns:            make(map[string]activeTurn),
+		quotaBlocked:           make(map[string]time.Time),
+		initialQuotaWarmupDone: make(chan struct{}),
+		initialQuotaKnown:      make(map[string]struct{}),
+		threadQuotaBuckets:     make(map[string]quotaBucket),
+		threadParents:          make(map[string]string),
+		staleSources:           make(map[string]map[string]struct{}),
+		commandPIDs:            make(map[string]map[int]string),
+		serverRoutes:           make(map[string]serverRequestRoute),
+		events:                 make(map[chan Event]struct{}),
+		profileClient:          &http.Client{Timeout: 10 * time.Second},
+		profileCache:           make(map[string]profileCacheEntry),
+		now:                    time.Now,
+		resetCreditsCache:      make(map[string]resetCreditsCacheEntry),
+		resetCreditsEndpoint:   rateLimitResetCreditsURL,
+		resetPreviews:          make(map[string]ResetCreditsPreview),
 	}, nil
 }
 
@@ -444,7 +463,15 @@ func (m *Multiplexer) Start(ctx context.Context) error {
 	if len(m.childEntries()) == 0 {
 		return errors.New("no Codex app-server process could be started")
 	}
+	if m.outputStarted.CompareAndSwap(
+		false,
+		true,
+	) {
+		go m.outputLoop(ctx)
+	}
+
 	go m.inboundLoop(ctx)
+	go m.primeInitialQuotaState(ctx)
 	go m.syncManagedConfigLoop(ctx)
 	go m.recoveryWatchLoop(ctx)
 	return nil
@@ -652,22 +679,47 @@ func (m *Multiplexer) routeNewThread(message protocol.Message) {
 	})
 }
 
-func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
+func (m *Multiplexer) routeExistingRequest(
+	message protocol.Message,
+) {
 	accountID := ""
-	if scopedAccountID, cleanedParams, ok := scopedPluginRequest(message.Method, message.Params); ok {
-		if account, exists := m.store.Account(scopedAccountID); exists && account.Enabled {
+
+	if scopedAccountID, cleanedParams, ok :=
+		scopedPluginRequest(
+			message.Method,
+			message.Params,
+		); ok {
+		if account, exists :=
+			m.store.Account(scopedAccountID); exists &&
+			account.Enabled {
 			message.Params = cleanedParams
-			if err := m.forward(scopedAccountID, message); err != nil {
-				m.write(protocol.Failure(message.ID, -32023, err.Error()))
+
+			if err := m.forward(
+				scopedAccountID,
+				message,
+			); err != nil {
+				m.write(
+					protocol.Failure(
+						message.ID,
+						-32023,
+						err.Error(),
+					),
+				)
 			}
+
 			return
 		}
 	}
-	threadID := threadIDFromParams(message.Params)
+
+	threadID := threadIDFromParams(
+		message.Params,
+	)
 
 	if threadID != "" {
 		switch message.Method {
-		case "turn/start", "thread/settings/update", "thread/resume":
+		case "turn/start",
+			"thread/settings/update",
+			"thread/resume":
 			m.rememberExplicitThreadQuotaBucket(
 				threadID,
 				message.Params,
@@ -675,28 +727,103 @@ func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
 		}
 	}
 
-	if threadID != "" {
-		accountID, _ = m.store.ThreadOwner(threadID)
+	// IMPORTANT:
+	// invalidate recovery BEFORE reading persistent ownership.
+	//
+	// Recovery commits ownership while holding the same active-turn lock.
+	// Therefore either:
+	//   1. recovery commits first and this user turn observes the new owner, or
+	//   2. this user turn supersedes first and recovery cannot commit.
+	if message.Method == "turn/start" &&
+		threadID != "" {
+		m.supersedeRecoveryForUserTurn(
+			threadID,
+		)
 	}
+
+	if threadID != "" {
+		accountID, _ =
+			m.store.ThreadOwner(threadID)
+	}
+
+	// turn/steer and turn/interrupt operate on the CURRENT execution, not
+	// merely the account that persistently owns the thread.
+	//
+	// A turn may currently be executing on another subscription because of
+	// quota failover/recovery. Sending turn/steer to the stale persistent
+	// owner causes "no active turn to steer", after which the desktop falls
+	// back to turn/start and renders the same user input a second time.
+	if (message.Method == "turn/steer" ||
+		message.Method == "turn/interrupt") &&
+		threadID != "" {
+		if activeAccountID, ok :=
+			m.activeExecutionAccount(
+				threadID,
+			); ok {
+			if accountID != "" &&
+				accountID != activeAccountID {
+				fmt.Fprintf(
+					os.Stderr,
+					"codex-mux: routing %s for thread %s to active account %s instead of persisted owner %s\n",
+					message.Method,
+					threadID,
+					activeAccountID,
+					accountID,
+				)
+			}
+
+			accountID = activeAccountID
+		}
+	}
+
 	if accountID == "" {
-		if controller, ok := m.store.Controller(); ok {
+		if controller, ok :=
+			m.store.Controller(); ok {
 			accountID = controller.ID
 		}
 	}
+
 	if accountID == "" {
-		m.write(protocol.Failure(message.ID, -32022, "no controller account is configured"))
+		m.write(
+			protocol.Failure(
+				message.ID,
+				-32022,
+				"no controller account is configured",
+			),
+		)
+
 		return
 	}
-	if message.Method == "turn/interrupt" && threadID != "" {
-		m.cancelRecoveryForUser(threadID)
+
+	if message.Method == "turn/interrupt" &&
+		threadID != "" {
+		m.cancelRecoveryForUser(
+			threadID,
+		)
 	}
-	if message.Method == "turn/start" && threadID != "" {
-		m.cancelParkedRecoveryForUser(threadID)
-		go m.routeTurnStart(message, threadID, accountID)
+
+	if message.Method == "turn/start" &&
+		threadID != "" {
+		m.routeTurnStart(
+			message,
+			threadID,
+			accountID,
+		)
+
 		return
 	}
-	if err := m.forward(accountID, message); err != nil {
-		m.write(protocol.Failure(message.ID, -32023, err.Error()))
+
+	if err := m.forward(
+		accountID,
+		message,
+	); err != nil {
+		m.write(
+			protocol.Failure(
+				message.ID,
+				-32023,
+				err.Error(),
+			),
+		)
 	}
 }
 
@@ -750,9 +877,19 @@ func (m *Multiplexer) rememberActiveTurn(
 	)
 
 	m.activeTurnMu.Lock()
+
 	active := m.activeTurns[threadID]
+
+	// Every renderer-originated turn is a new execution generation.
+	// Any automatic recovery that captured an older generation is no
+	// longer allowed to create a replacement execution.
+	active.generation++
 	active.accountID = accountID
-	active.params = append(json.RawMessage(nil), message.Params...)
+	active.turnID = ""
+	active.params = append(
+		json.RawMessage(nil),
+		message.Params...,
+	)
 	active.excluded = cloneAccountSet(excluded)
 	active.lastActivity = m.now()
 	active.recovering = false
@@ -760,6 +897,7 @@ func (m *Multiplexer) rememberActiveTurn(
 	active.failureRaw = nil
 	active.recoveryCause = ""
 	active.agentMessageComplete = false
+
 	m.activeTurns[threadID] = active
 	m.activeTurnMu.Unlock()
 }
@@ -868,6 +1006,200 @@ func (m *Multiplexer) routeAggregatedRateLimits(message protocol.Message) {
 	m.write(protocol.Success(message.ID, result))
 }
 
+func (m *Multiplexer) markInitialQuotaKnown(
+	accountID string,
+) {
+	if accountID == "" ||
+		m.initialQuotaKnown == nil {
+		return
+	}
+
+	m.quotaMu.Lock()
+	m.initialQuotaKnown[accountID] =
+		struct{}{}
+	m.quotaMu.Unlock()
+}
+
+func (m *Multiplexer) initialQuotaStateKnown(
+	accountID string,
+) bool {
+	if accountID == "" ||
+		m.initialQuotaKnown == nil {
+		return false
+	}
+
+	m.quotaMu.Lock()
+	_, ok :=
+		m.initialQuotaKnown[accountID]
+	m.quotaMu.Unlock()
+
+	return ok
+}
+
+func (m *Multiplexer) primeInitialQuotaState(
+	parent context.Context,
+) {
+	if m.initialQuotaWarmupDone == nil {
+		return
+	}
+
+	m.initialQuotaWarmupOnce.Do(
+		func() {
+			defer close(
+				m.initialQuotaWarmupDone,
+			)
+
+			ctx, cancel :=
+				context.WithTimeout(
+					parent,
+					requestTimeout,
+				)
+			defer cancel()
+
+			snapshots :=
+				m.accountSnapshots(
+					ctx,
+					false,
+				)
+
+			for _, snapshot := range snapshots {
+				if !snapshot.Enabled ||
+					!snapshot.Connected ||
+					snapshot.AuthType !=
+						"chatgpt" ||
+					snapshot.RateLimits ==
+						nil {
+					continue
+				}
+
+				m.markInitialQuotaKnown(
+					snapshot.ID,
+				)
+
+				if !rateLimitsHaveCapacity(
+					snapshot.RateLimits,
+				) {
+					m.markAccountQuotaBlockedFor(
+						snapshot.ID,
+						quotaBucketNormal,
+					)
+				}
+			}
+		},
+	)
+}
+
+func (m *Multiplexer) waitForInitialQuotaWarmup() {
+	if m.initialQuotaWarmupDone == nil {
+		return
+	}
+
+	select {
+	case <-m.initialQuotaWarmupDone:
+		return
+	default:
+	}
+
+	timer := time.NewTimer(
+		requestTimeout,
+	)
+	defer timer.Stop()
+
+	select {
+	case <-m.initialQuotaWarmupDone:
+	case <-timer.C:
+		fmt.Fprintln(
+			os.Stderr,
+			"codex-mux: initial quota warmup timed out; validating owner on demand",
+		)
+	}
+}
+
+func (m *Multiplexer) refreshInitialOwnerQuotaState(
+	accountID string,
+) {
+	if accountID == "" {
+		return
+	}
+
+	ctx, cancel :=
+		context.WithTimeout(
+			context.Background(),
+			requestTimeout,
+		)
+	defer cancel()
+
+	snapshot, err :=
+		m.accountSnapshotWithProfile(
+			ctx,
+			accountID,
+			false,
+		)
+
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"codex-mux: cold-start quota validation for %s failed: %v\n",
+			accountID,
+			err,
+		)
+		return
+	}
+
+	if snapshot.RateLimits == nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"codex-mux: cold-start quota validation for %s returned no normal rate-limit state\n",
+			accountID,
+		)
+		return
+	}
+
+	m.markInitialQuotaKnown(
+		accountID,
+	)
+
+	if !rateLimitsHaveCapacity(
+		snapshot.RateLimits,
+	) {
+		m.markAccountQuotaBlockedFor(
+			accountID,
+			quotaBucketNormal,
+		)
+	}
+}
+
+func (m *Multiplexer) activeExecutionAccount(
+	threadID string,
+) (string, bool) {
+	root := m.rootThreadID(
+		threadID,
+	)
+
+	if root == "" {
+		root = threadID
+	}
+
+	if root == "" {
+		return "", false
+	}
+
+	active, ok :=
+		m.activeTurnFor(
+			root,
+			"",
+		)
+
+	if !ok ||
+		active.accountID == "" ||
+		active.recovering ||
+		active.parked {
+		return "", false
+	}
+
+	return active.accountID, true
+}
+
 func (m *Multiplexer) routeTurnStart(
 	message protocol.Message,
 	threadID string,
@@ -878,41 +1210,89 @@ func (m *Multiplexer) routeTurnStart(
 		message.Params,
 	)
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		2*requestTimeout,
-	)
-	snapshot, err := m.accountSnapshotWithProfile(
-		ctx,
-		ownerID,
-		false,
-	)
-	cancel()
+	owner, ownerExists :=
+		m.store.Account(ownerID)
 
-	if err == nil &&
-		!m.accountQuotaBlockedFor(ownerID, bucket) &&
-		accountHasCapacityForQuotaBucket(snapshot, bucket) {
-		if err := m.forward(ownerID, message); err != nil {
-			m.write(protocol.Failure(
-				message.ID,
-				-32023,
-				err.Error(),
-			))
-		}
-		return
-	}
+	// Normal turns retain the zero-RPC fast path after startup, but the
+	// first turn must not interpret an empty quota cache as proof that the
+	// pinned account has capacity.
+	if bucket == quotaBucketNormal &&
+		ownerExists &&
+		owner.Enabled &&
+		m.initialQuotaWarmupDone != nil {
+		m.waitForInitialQuotaWarmup()
 
-	if err != nil {
-		fmt.Fprintf(
-			os.Stderr,
-			"codex-mux: owner %s capacity check failed for thread %s: %v; failing closed\n",
+		if !m.initialQuotaStateKnown(
 			ownerID,
-			threadID,
-			err,
-		)
+		) &&
+			!m.accountQuotaBlockedFor(
+				ownerID,
+				bucket,
+			) {
+			// Startup warmup may have timed out or account/rateLimits/read
+			// may have transiently failed. Retry only this owner once.
+			m.refreshInitialOwnerQuotaState(
+				ownerID,
+			)
+
+			if !m.initialQuotaStateKnown(
+				ownerID,
+			) &&
+				!m.accountQuotaBlockedFor(
+					ownerID,
+					bucket,
+				) {
+				fmt.Fprintf(
+					os.Stderr,
+					"codex-mux: cold-start quota state for %s remains unknown; routing through slow selector\n",
+					ownerID,
+				)
+
+				excluded := map[string]struct{}{
+					ownerID: {},
+				}
+
+				go m.robustFailoverTurn(
+					message,
+					threadID,
+					ownerID,
+					excluded,
+				)
+
+				return
+			}
+		}
 	}
 
-	excluded := map[string]struct{}{ownerID: {}}
+	// Normal existing-thread turns deliberately avoid live quota RPCs once
+	// initial state is known. A real app-server usage-limit response remains
+	// authoritative and is still handled by the existing robust failover.
+	if ownerExists &&
+		owner.Enabled &&
+		!m.accountQuotaBlockedFor(
+			ownerID,
+			bucket,
+		) {
+		if err := m.forward(
+			ownerID,
+			message,
+		); err == nil {
+			return
+		} else {
+			fmt.Fprintf(
+				os.Stderr,
+				"codex-mux: fast-path turn forward to %s failed for thread %s: %v; failing over\n",
+				ownerID,
+				threadID,
+				err,
+			)
+		}
+	}
+
+	excluded := map[string]struct{}{
+		ownerID: {},
+	}
+
 	go m.robustFailoverTurn(
 		message,
 		threadID,
@@ -1124,7 +1504,9 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 	}
 
 	if message.Method == "account/rateLimits/updated" {
-		go m.forwardAggregatedRateLimitNotification(inbound.Raw)
+		m.scheduleAggregatedRateLimitNotification(
+			inbound.Raw,
+		)
 		return
 	}
 
@@ -1157,6 +1539,71 @@ func (m *Multiplexer) publishAggregatedRateLimits() {
 		Method: "account/rateLimits/updated",
 		Params: params,
 	})
+}
+
+func (m *Multiplexer) scheduleAggregatedRateLimitNotification(
+	fallback []byte,
+) {
+	fallback = append([]byte(nil), fallback...)
+
+	m.rateLimitNotifyMu.Lock()
+
+	// Always retain the newest raw notification for error fallback.
+	m.rateLimitNotifyFallback = fallback
+
+	if m.rateLimitNotifyRunning {
+		// One refresh is already scheduled or executing. Record that state
+		// changed again so the worker performs one more pass afterward.
+		m.rateLimitNotifyPending = true
+		m.rateLimitNotifyMu.Unlock()
+		return
+	}
+
+	m.rateLimitNotifyRunning = true
+	m.rateLimitNotifyPending = false
+	m.rateLimitNotifyMu.Unlock()
+
+	go m.runAggregatedRateLimitNotificationLoop()
+}
+
+func (m *Multiplexer) runAggregatedRateLimitNotificationLoop() {
+	for {
+		// Children commonly emit these notifications within a few
+		// milliseconds of each other. A tiny debounce collapses the burst
+		// while being imperceptible to the quota UI.
+		time.Sleep(75 * time.Millisecond)
+
+		m.rateLimitNotifyMu.Lock()
+
+		fallback := append(
+			[]byte(nil),
+			m.rateLimitNotifyFallback...,
+		)
+
+		// Any notification already received before this snapshot is covered
+		// by the snapshot we are about to perform.
+		m.rateLimitNotifyPending = false
+
+		m.rateLimitNotifyMu.Unlock()
+
+		m.forwardAggregatedRateLimitNotification(
+			fallback,
+		)
+
+		m.rateLimitNotifyMu.Lock()
+
+		if m.rateLimitNotifyPending {
+			// State changed while the aggregate snapshot was running.
+			// Perform exactly one more coalesced pass.
+			m.rateLimitNotifyMu.Unlock()
+			continue
+		}
+
+		m.rateLimitNotifyRunning = false
+		m.rateLimitNotifyMu.Unlock()
+
+		return
+	}
 }
 
 func (m *Multiplexer) forwardAggregatedRateLimitNotification(fallback []byte) {
@@ -1542,6 +1989,50 @@ func (m *Multiplexer) continueAutonomousTurnAfterUsageLimit(
 	}
 }
 
+func (m *Multiplexer) outputLoop(
+	ctx context.Context,
+) {
+	for {
+		select {
+		case payload := <-m.outputQueue:
+			if len(payload) == 0 {
+				continue
+			}
+
+			if _, err := m.output.Write(
+				payload,
+			); err != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"codex-mux: write renderer output: %v\n",
+					err,
+				)
+			}
+
+		case <-ctx.Done():
+			// Flush anything already accepted by writeRaw. Use a
+			// non-blocking drain so shutdown cannot wait for future work.
+			for {
+				select {
+				case payload := <-m.outputQueue:
+					if len(payload) == 0 {
+						continue
+					}
+
+					if _, err := m.output.Write(
+						payload,
+					); err != nil {
+						return
+					}
+
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
 func (m *Multiplexer) forwardServerRequest(inbound backend.Inbound) {
 	sequence := m.serverSequence.Add(1)
 	newID := protocol.StringID(fmt.Sprintf("codex-mux:%s:%d", inbound.AccountID, sequence))
@@ -1597,10 +2088,36 @@ func (m *Multiplexer) write(message protocol.Message) {
 	m.writeRaw(encoded)
 }
 
-func (m *Multiplexer) writeRaw(encoded []byte) {
+func (m *Multiplexer) writeRaw(
+	encoded []byte,
+) {
+	payload := make(
+		[]byte,
+		len(encoded)+1,
+	)
+
+	copy(
+		payload,
+		encoded,
+	)
+
+	payload[len(encoded)] = '\n'
+
+	// Preserve exactly one total ordering for output generated by all mux
+	// goroutines. Once the queue is enabled, holding this mutex only covers
+	// a memory/channel operation -- never the renderer pipe write itself.
 	m.outputMu.Lock()
 	defer m.outputMu.Unlock()
-	_, _ = m.output.Write(append(encoded, '\n'))
+
+	if !m.outputStarted.Load() ||
+		m.outputQueue == nil {
+		_, _ = m.output.Write(
+			payload,
+		)
+		return
+	}
+
+	m.outputQueue <- payload
 }
 
 type childEntry struct {
@@ -1947,17 +2464,40 @@ func isUsageLimitResponse(message protocol.Message) bool {
 	)
 }
 
-func (m *Multiplexer) allSubscriptionsDepleted(ctx context.Context, id json.RawMessage) protocol.Message {
+func (m *Multiplexer) allSubscriptionsDepleted(
+	ctx context.Context,
+	id json.RawMessage,
+) protocol.Message {
 	var resetsAt *int64
-	if preview := m.currentRateLimitPreview(); preview != nil && preview.Mode.isAllDepleted() {
+
+	if preview :=
+		m.currentRateLimitPreview(); preview != nil &&
+		preview.Mode.isAllDepleted() {
 		resetsAt = preview.ResetsAt
-	} else if limits, err := m.AggregatedRateLimits(ctx); err == nil {
-		weekly, _ := longestAndShortestWindow(limits)
+	} else if limits, err :=
+		m.AggregatedRateLimits(ctx); err == nil {
+		weekly, _ :=
+			longestAndShortestWindow(
+				limits,
+			)
+
 		if weekly != nil {
-			resetsAt = weekly.ResetsAt
+			resetsAt =
+				weekly.ResetsAt
 		}
 	}
-	return allSubscriptionsDepleted(id, resetsAt)
+
+	// Unix zero is not a meaningful subscription reset time. Never turn an
+	// absent/invalid reset into "January 1, 1970" in router-generated errors.
+	if resetsAt != nil &&
+		*resetsAt <= 0 {
+		resetsAt = nil
+	}
+
+	return allSubscriptionsDepleted(
+		id,
+		resetsAt,
+	)
 }
 
 func (m *Multiplexer) allSubscriptionsDepletedForQuotaBucket(
@@ -1966,22 +2506,43 @@ func (m *Multiplexer) allSubscriptionsDepletedForQuotaBucket(
 	bucket quotaBucket,
 ) protocol.Message {
 	if bucket != quotaBucketReserve {
-		return m.allSubscriptionsDepleted(ctx, id)
+		return m.allSubscriptionsDepleted(
+			ctx,
+			id,
+		)
 	}
 
 	var resetsAt *int64
 
-	_, byLimitID, err := m.AggregatedRateLimitState(ctx)
+	_, byLimitID, err :=
+		m.AggregatedRateLimitState(ctx)
+
 	if err == nil {
-		limits := reserveRateLimitsFromMap(byLimitID)
-		weekly, _ := longestAndShortestWindow(limits)
+		limits :=
+			reserveRateLimitsFromMap(
+				byLimitID,
+			)
+
+		weekly, _ :=
+			longestAndShortestWindow(
+				limits,
+			)
 
 		if weekly != nil {
-			resetsAt = weekly.ResetsAt
+			resetsAt =
+				weekly.ResetsAt
 		}
 	}
 
-	return allSubscriptionsDepleted(id, resetsAt)
+	if resetsAt != nil &&
+		*resetsAt <= 0 {
+		resetsAt = nil
+	}
+
+	return allSubscriptionsDepleted(
+		id,
+		resetsAt,
+	)
 }
 
 func allSubscriptionsDepleted(id json.RawMessage, resetsAt *int64) protocol.Message {

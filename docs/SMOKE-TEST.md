@@ -34,8 +34,8 @@ signature and reuse the same Apple team as the previous installed build.
 
 ## Appshots and Computer Use
 
-- In System Settings, grant Accessibility to Codex Subscription Router and
-  Screen & System Audio Recording to Codex Subscription Router Computer Use.
+- In System Settings, grant Accessibility to Codex Router and
+  Screen & System Audio Recording to Codex Router Computer Use.
   Quit and reopen when macOS asks.
 - Capture an Appshot from the attachment menu and with the Command-key shortcut.
 - Run a Computer Use task and confirm the native helper performs the action

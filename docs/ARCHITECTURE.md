@@ -7,7 +7,7 @@ state directory remain stable across the product rename so existing macOS
 privacy grants, connected accounts, and sticky thread ownership continue to
 work.
 
-Codex Subscription Router replaces the copied app's bundled `codex` executable
+Codex Router replaces the copied app's bundled `codex` executable
 with a small Go multiplexer and keeps the original binary beside it as
 `codex.real`.
 

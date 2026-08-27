@@ -2,11 +2,11 @@
 
 set -euo pipefail
 
-readonly REPOSITORY_URL="https://github.com/b-nnett/codex-subscription-router.git"
-readonly DEFAULT_SOURCE_DIR="${HOME}/.codex-subscription-router/source"
-readonly SOURCE_DIR="${CODEX_SUBSCRIPTION_ROUTER_SOURCE_DIR:-${DEFAULT_SOURCE_DIR}}"
-readonly DESTINATION_APP="${HOME}/Applications/Codex Subscription Router.app"
-readonly DESTINATION_HELPER="${HOME}/Applications/Codex Subscription Router Computer Use.app"
+readonly REPOSITORY_URL="https://github.com/tomyteeee/Codex-Router.git"
+readonly DEFAULT_SOURCE_DIR="${HOME}/.codex-router/source"
+readonly SOURCE_DIR="${CODEX_ROUTER_SOURCE_DIR:-${DEFAULT_SOURCE_DIR}}"
+readonly DESTINATION_APP="${HOME}/Applications/Codex Router.app"
+readonly DESTINATION_HELPER="${HOME}/Applications/Codex Router Computer Use.app"
 
 log() {
     printf '\n==> %s\n' "$1" >&2
@@ -19,10 +19,10 @@ fail() {
 
 require_prerequisites() {
     if [ "$(uname -s)" != "Darwin" ]; then
-        fail "Codex Subscription Router supports macOS only."
+        fail "Codex Router supports macOS only."
     fi
     if [ "$(uname -m)" != "arm64" ]; then
-        fail "Codex Subscription Router currently requires Apple silicon."
+        fail "Codex Router currently requires Apple silicon."
     fi
     if [ ! -d "/Applications/ChatGPT.app" ]; then
         fail "install the official ChatGPT app in /Applications first."
@@ -75,7 +75,7 @@ resolve_source_dir() {
             fail "${SOURCE_DIR} has local changes; preserve or commit them before updating."
         fi
         if [ "$(git -C "${SOURCE_DIR}" branch --show-current)" != "main" ]; then
-            fail "${SOURCE_DIR} is not on main; switch branches or set CODEX_SUBSCRIPTION_ROUTER_SOURCE_DIR."
+            fail "${SOURCE_DIR} is not on main; switch branches or set CODEX_ROUTER_SOURCE_DIR."
         fi
         log "Updating source"
         git -C "${SOURCE_DIR}" pull --ff-only origin main >&2
@@ -133,10 +133,10 @@ main() {
         patch_arguments+=("--force")
     fi
 
-    log "Building and signing Codex Subscription Router"
+    log "Building and signing Codex Router"
     python3 scripts/patch_app.py "${patch_arguments[@]}"
 
-    log "Launching Codex Subscription Router"
+    log "Launching Codex Router"
     open "${DESTINATION_APP}"
     printf '\nInstalled successfully: %s\n' "${DESTINATION_APP}"
 }

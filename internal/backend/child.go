@@ -14,7 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/b-nnett/codex-subscription-router/internal/protocol"
+	"github.com/tomyteeee/Codex-Router/internal/protocol"
 )
 
 type Inbound struct {

@@ -1,10 +1,10 @@
-# Codex Subscription Router
+# Codex Router
 
 ![Multi-subscription account menu](screenshots/account-menu.png)
 
 Use multiple ChatGPT subscriptions from one independent macOS desktop app.
 
-Codex Subscription Router creates a locally patched copy of the official
+Codex Router creates a locally patched copy of the official
 ChatGPT app, balances new chats across connected subscriptions, and keeps every
 thread on one subscription so follow-up turns retain conversation context and
 benefit from account-level caching.
@@ -46,7 +46,7 @@ Each child has an isolated Codex home, while the multiplexer records the owner
 of every thread.
 
 ```text
-Codex Subscription Router.app
+Codex Router.app
         │
         │ one app-server connection
         ▼
@@ -68,7 +68,7 @@ Read [the architecture](docs/ARCHITECTURE.md) for the request flow and
 
 ## Compatibility
 
-Codex Subscription Router currently targets:
+Codex Router currently targets:
 
 | Component | Supported value |
 | --- | --- |
@@ -100,11 +100,11 @@ Run one command. It downloads or updates the source, installs the locked build
 dependency, creates the independently signed app, and launches it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/b-nnett/codex-subscription-router/main/install.sh | /bin/bash
+curl -fsSL https://raw.githubusercontent.com/tomyteeee/Codex-Router/main/install.sh | /bin/bash
 ```
 
 The installer keeps its source checkout in
-`~/.codex-subscription-router/source`. On an existing installation it uses the
+`~/.codex-router/source`. On an existing installation it uses the
 same account state, creates a recoverable backup, and requires signing-team
 continuity so macOS privacy grants remain valid. It stops with a clear message
 instead of making a partial installation when a prerequisite or upstream
@@ -116,24 +116,24 @@ compatibility check fails.
 
 ### Install via prompt
 
-> Install Codex Subscription Router from `https://github.com/b-nnett/codex-subscription-router` on this Mac using the repository's supported one-command installer, without modifying the official ChatGPT app or deleting any existing router state. Verify the resulting app and Computer Use helper signatures, launch the app, and ask me only if a prerequisite or macOS permission requires interaction.
+> Install Codex Router from `https://github.com/tomyteeee/Codex-Router` on this Mac using the repository's supported one-command installer, without modifying the official ChatGPT app or deleting any existing router state. Verify the resulting app and Computer Use helper signatures, launch the app, and ask me only if a prerequisite or macOS permission requires interaction.
 
 ### Install from a clone
 
 ```sh
-git clone https://github.com/b-nnett/codex-subscription-router.git
-cd codex-subscription-router
+git clone https://github.com/tomyteeee/Codex-Router.git
+cd Codex-Router
 npm ci --ignore-scripts
 python3 scripts/patch_app.py
-open "$HOME/Applications/Codex Subscription Router.app"
+open "$HOME/Applications/Codex Router.app"
 ```
 
 This creates:
 
-- `~/Applications/Codex Subscription Router.app`
-- `~/Applications/Codex Subscription Router Computer Use.app`
+- `~/Applications/Codex Router.app`
+- `~/Applications/Codex Router Computer Use.app`
 - an independent desktop profile under
-  `~/Library/Application Support/Codex Subscription Router`
+  `~/Library/Application Support/Codex Router`
 
 The first valid Developer ID Application identity is selected, falling back to
 an Apple Development identity. Select a certificate explicitly when needed:
@@ -162,13 +162,13 @@ Open **System Settings → Privacy & Security** and grant:
 
 | Permission | Application |
 | --- | --- |
-| Accessibility | Codex Subscription Router |
-| Screen & System Audio Recording | Codex Subscription Router Computer Use |
+| Accessibility | Codex Router |
+| Screen & System Audio Recording | Codex Router Computer Use |
 
 When macOS offers **Quit & Reopen**, use it. If the app does not relaunch,
-reopen Codex Subscription Router manually. If the Computer Use row does not
+reopen Codex Router manually. If the Computer Use row does not
 appear, press the plus button and choose
-`~/Applications/Codex Subscription Router Computer Use.app`.
+`~/Applications/Codex Router Computer Use.app`.
 
 Do not select the official ChatGPT or Codex Computer Use helper for this build;
 the independent app has its own identity and permission rows. macOS may also
@@ -179,7 +179,7 @@ request Automation access the first time Computer Use controls another app.
 1. Open the profile menu at the bottom of the sidebar.
 2. Select **Add another subscription**.
 3. Complete the displayed device-code sign-in in your browser.
-4. Return to Codex Subscription Router and wait for the account row to appear.
+4. Return to Codex Router and wait for the account row to appear.
 
 While the code is visible, clicking away does not dismiss the menu. Clicking
 the code copies it and opens the verification page.
@@ -226,7 +226,7 @@ as compatible, then rebuild:
 python3 scripts/patch_app.py --force
 ```
 
-Quit Codex Subscription Router and its Computer Use helper first. Existing
+Quit Codex Router and its Computer Use helper first. Existing
 destinations are moved to timestamped directories under `~/.codex-mux/backups`;
 account state and credentials are stored outside the app bundle and remain
 intact. Delete old backups manually after the rebuilt app passes the smoke test.
@@ -243,7 +243,7 @@ helper and socket paths and are not relocatable or intended for redistribution.
 | `~/.codex-mux/accounts/<id>/codex-home` | Isolated secondary account data |
 | `~/.codex-mux/control-token` | Token for the loopback-only control service |
 | `~/.codex-mux/backups` | Recoverable app and helper backups |
-| `~/Library/Application Support/Codex Subscription Router` | Independent desktop profile |
+| `~/Library/Application Support/Codex Router` | Independent desktop profile |
 
 The control service binds only to `127.0.0.1` and protects private routes with a
 random 256-bit token. OAuth tokens stay inside their account's Codex home and

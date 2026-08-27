@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/b-nnett/codex-subscription-router/internal/state"
+	"github.com/tomyteeee/Codex-Router/internal/state"
 )
 
 const (
@@ -85,7 +85,7 @@ func fetchProfileImageURL(
 		request.Header.Set("ChatGPT-Account-ID", credentials.Tokens.AccountID)
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", "Codex Subscription Router")
+	request.Header.Set("User-Agent", "Codex Router")
 
 	response, err := client.Do(request)
 	if err != nil {

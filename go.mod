@@ -1,3 +1,3 @@
-module github.com/b-nnett/codex-subscription-router
+module github.com/tomyteeee/Codex-Router
 
 go 1.26.0

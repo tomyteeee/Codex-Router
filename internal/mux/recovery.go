@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/b-nnett/codex-subscription-router/internal/backend"
-	"github.com/b-nnett/codex-subscription-router/internal/protocol"
-	"github.com/b-nnett/codex-subscription-router/internal/state"
+	"github.com/tomyteeee/Codex-Router/internal/backend"
+	"github.com/tomyteeee/Codex-Router/internal/protocol"
+	"github.com/tomyteeee/Codex-Router/internal/state"
 )
 
 const (
@@ -105,7 +105,18 @@ func (m *Multiplexer) markAccountQuotaBlockedFor(
 	}
 
 	m.quotaBlocked[key] = until
+
+	if bucket == quotaBucketNormal &&
+		m.initialQuotaKnown != nil {
+		m.initialQuotaKnown[accountID] =
+			struct{}{}
+	}
+
 	m.quotaMu.Unlock()
+
+	if m.store == nil {
+		return
+	}
 
 	// Refine the temporary block to the server-provided reset time for the
 	// exact allowance that failed.
@@ -373,117 +384,308 @@ func (m *Multiplexer) inboundSourceIsStale(accountID, method string, params json
 	return stale
 }
 
-func (m *Multiplexer) beginRecovery(threadID, sourceAccountID string) (activeTurn, bool) {
+func (m *Multiplexer) supersedeRecoveryForUserTurn(
+	threadID string,
+) {
 	root := m.rootThreadID(threadID)
+
 	if root == "" {
 		root = threadID
 	}
+
 	if root == "" {
-		return activeTurn{}, false
+		return
 	}
 
 	m.activeTurnMu.Lock()
 	defer m.activeTurnMu.Unlock()
 
 	active, ok := m.activeTurns[root]
+
 	if !ok {
-		active = activeTurn{
-			accountID:    sourceAccountID,
-			lastActivity: m.now(),
-		}
+		return
 	}
-	if active.accountID != "" && sourceAccountID != "" && active.accountID != sourceAccountID {
-		return activeTurn{}, false
-	}
-	if active.recovering || active.parked {
-		return activeTurn{}, false
-	}
-	active.accountID = sourceAccountID
-	active.recovering = true
-	active.parked = false
+
+	// Invalidate every recovery worker that captured the previous
+	// generation before forwarding the new user turn.
 	active.generation++
-	active.lastActivity = m.now()
-	m.activeTurns[root] = active
-
-	active.params = append(json.RawMessage(nil), active.params...)
-	active.excluded = cloneAccountSet(active.excluded)
-	return active, true
-}
-
-func (m *Multiplexer) setRecoveryFailed(root, sourceAccountID string) {
-	m.activeTurnMu.Lock()
-	if active, ok := m.activeTurns[root]; ok {
-		if sourceAccountID == "" || active.accountID == sourceAccountID {
-			active.recovering = false
-			active.lastActivity = m.now()
-			m.activeTurns[root] = active
-		}
-	}
-	m.activeTurnMu.Unlock()
-}
-
-func (m *Multiplexer) setRecoverySucceeded(
-	root string,
-	targetAccountID string,
-	turnID string,
-	params json.RawMessage,
-	excluded map[string]struct{},
-) {
-	m.activeTurnMu.Lock()
-	active := m.activeTurns[root]
-	active.accountID = targetAccountID
-	if turnID != "" {
-		active.turnID = turnID
-	}
-	active.params = append(json.RawMessage(nil), params...)
-	active.excluded = cloneAccountSet(excluded)
 	active.recovering = false
 	active.parked = false
+	active.recoveryCause = ""
+	active.failureRaw = nil
 	active.lastActivity = m.now()
+
 	m.activeTurns[root] = active
-	m.activeTurnMu.Unlock()
 }
 
-func (m *Multiplexer) setRecoveryParked(
-	root, sourceAccountID, cause string,
-	failedRaw []byte,
+func (m *Multiplexer) recoveryLeaseCurrent(
+	root string,
+	sourceAccountID string,
+	generation uint64,
 ) bool {
 	m.activeTurnMu.Lock()
 	defer m.activeTurnMu.Unlock()
 
 	active, ok := m.activeTurns[root]
+
 	if !ok {
 		return false
 	}
-	if active.accountID != sourceAccountID {
-		return false
-	}
-	alreadyParked := active.parked
-	active.recovering = false
-	active.parked = true
-	active.recoveryCause = cause
-	active.failureRaw = append([]byte(nil), failedRaw...)
-	active.lastActivity = m.now()
-	m.activeTurns[root] = active
-	return !alreadyParked
+
+	return active.accountID ==
+		sourceAccountID &&
+		active.recovering &&
+		!active.parked &&
+		active.generation ==
+			generation
 }
 
-func (m *Multiplexer) claimParkedRecovery(root string) (activeTurn, bool) {
+func (m *Multiplexer) interruptRecoveryTarget(
+	accountID string,
+	root string,
+	turnID string,
+) {
+	child, ok := m.child(accountID)
+
+	if !ok {
+		return
+	}
+
+	params, err := json.Marshal(
+		map[string]any{
+			"threadId": root,
+			"turnId":   turnID,
+		},
+	)
+
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		recoveryInterruptWindow,
+	)
+	defer cancel()
+
+	_, _ = child.Request(
+		ctx,
+		"turn/interrupt",
+		params,
+	)
+}
+
+func (m *Multiplexer) beginRecovery(
+	threadID string,
+	sourceAccountID string,
+) (activeTurn, bool) {
+	root := m.rootThreadID(threadID)
+
+	if root == "" {
+		root = threadID
+	}
+
+	if root == "" {
+		return activeTurn{}, false
+	}
+
 	m.activeTurnMu.Lock()
 	defer m.activeTurnMu.Unlock()
 
 	active, ok := m.activeTurns[root]
-	if !ok || !active.parked || active.recovering {
+
+	// Never manufacture an autonomous task from a stray notification.
+	// Recovery requires a renderer-originated root turn that we actually
+	// tracked.
+	if !ok {
 		return activeTurn{}, false
 	}
-	active.parked = false
+
+	if active.accountID != "" &&
+		sourceAccountID != "" &&
+		active.accountID != sourceAccountID {
+		return activeTurn{}, false
+	}
+
+	if active.recovering ||
+		active.parked {
+		return activeTurn{}, false
+	}
+
+	active.accountID = sourceAccountID
 	active.recovering = true
+	active.parked = false
+
+	// This generation is the lease held by this particular recovery.
+	active.generation++
 	active.lastActivity = m.now()
+
 	m.activeTurns[root] = active
 
-	active.params = append(json.RawMessage(nil), active.params...)
-	active.excluded = cloneAccountSet(active.excluded)
-	active.failureRaw = append([]byte(nil), active.failureRaw...)
+	active.params = append(
+		json.RawMessage(nil),
+		active.params...,
+	)
+	active.excluded = cloneAccountSet(
+		active.excluded,
+	)
+	active.failureRaw = append(
+		[]byte(nil),
+		active.failureRaw...,
+	)
+
+	return active, true
+}
+
+func (m *Multiplexer) setRecoveryFailed(
+	root string,
+	sourceAccountID string,
+	expectedGeneration uint64,
+) bool {
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	active, ok := m.activeTurns[root]
+
+	if !ok ||
+		active.accountID != sourceAccountID ||
+		!active.recovering ||
+		active.parked ||
+		active.generation != expectedGeneration {
+		return false
+	}
+
+	active.recovering = false
+	active.lastActivity = m.now()
+
+	m.activeTurns[root] = active
+
+	return true
+}
+
+func (m *Multiplexer) setRecoverySucceeded(
+	root string,
+	sourceAccountID string,
+	targetAccountID string,
+	turnID string,
+	params json.RawMessage,
+	excluded map[string]struct{},
+	expectedGeneration uint64,
+) (bool, error) {
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	active, ok := m.activeTurns[root]
+
+	if !ok ||
+		active.accountID != sourceAccountID ||
+		!active.recovering ||
+		active.parked ||
+		active.generation != expectedGeneration {
+		return false, nil
+	}
+
+	// Ownership and the in-memory recovery state must be committed while the
+	// same generation lease is held. A user turn uses this same lock before
+	// reading ThreadOwner, eliminating the stale-owner race.
+	if err := m.store.SetThreadOwner(
+		root,
+		targetAccountID,
+	); err != nil {
+		return false, err
+	}
+
+	active.accountID = targetAccountID
+
+	if turnID != "" {
+		active.turnID = turnID
+	}
+
+	active.params = append(
+		json.RawMessage(nil),
+		params...,
+	)
+	active.excluded = cloneAccountSet(excluded)
+	active.recovering = false
+	active.parked = false
+	active.lastActivity = m.now()
+
+	m.activeTurns[root] = active
+
+	return true, nil
+}
+
+func (m *Multiplexer) setRecoveryParked(
+	root string,
+	sourceAccountID string,
+	cause string,
+	failedRaw []byte,
+	expectedGeneration uint64,
+) bool {
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	active, ok := m.activeTurns[root]
+
+	if !ok ||
+		active.accountID != sourceAccountID ||
+		!active.recovering ||
+		active.parked ||
+		active.generation != expectedGeneration {
+		return false
+	}
+
+	active.recovering = false
+	active.parked = true
+	active.recoveryCause = cause
+	active.failureRaw = append(
+		[]byte(nil),
+		failedRaw...,
+	)
+	active.lastActivity = m.now()
+
+	m.activeTurns[root] = active
+
+	// recovery parked generation mismatch is rejected above.
+	return true
+}
+
+func (m *Multiplexer) claimParkedRecovery(
+	root string,
+) (activeTurn, bool) {
+	m.activeTurnMu.Lock()
+	defer m.activeTurnMu.Unlock()
+
+	active, ok := m.activeTurns[root]
+
+	if !ok ||
+		!active.parked ||
+		active.recovering {
+		return activeTurn{}, false
+	}
+
+	active.parked = false
+	active.recovering = true
+
+	// Every parked retry gets its own lease generation. A user turn can
+	// invalidate this attempt exactly like an ordinary recovery.
+	active.generation++
+	active.lastActivity = m.now()
+
+	m.activeTurns[root] = active
+
+	active.params = append(
+		json.RawMessage(nil),
+		active.params...,
+	)
+	active.excluded = cloneAccountSet(
+		active.excluded,
+	)
+	active.failureRaw = append(
+		[]byte(nil),
+		active.failureRaw...,
+	)
+
 	return active, true
 }
 
@@ -931,24 +1133,66 @@ func (m *Multiplexer) clearCompletedThreadTree(threadID, accountID string) {
 	m.commandMu.Unlock()
 }
 
-func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool {
+func (m *Multiplexer) observeRecoveryNotification(
+	inbound backend.Inbound,
+) bool {
 	message := inbound.Message
 	method := message.Method
 
+	var started threadStartMeta
+
 	if method == "thread/started" {
-		m.recordThreadStarted(inbound.AccountID, message.Params)
+		started = m.recordThreadStarted(
+			inbound.AccountID,
+			message.Params,
+		)
 	}
+
 	if method == "turn/started" {
-		m.recordTurnStarted(inbound.AccountID, message.Params)
+		m.recordTurnStarted(
+			inbound.AccountID,
+			message.Params,
+		)
 	}
-	m.trackCommandLifecycle(method, message.Params)
 
-	threadID := threadIDFromInboundNotification(method, message.Params)
+	m.trackCommandLifecycle(
+		method,
+		message.Params,
+	)
+
+	threadID := threadIDFromInboundNotification(
+		method,
+		message.Params,
+	)
+
+	if threadID == "" &&
+		started.ID != "" {
+		threadID = started.ID
+	}
+
 	if threadID != "" {
-		m.touchThread(threadID, inbound.AccountID)
+		m.touchThread(
+			threadID,
+			inbound.AccountID,
+		)
 	}
 
-	if method == "item/started" && threadID != "" {
+	childThread :=
+		started.ParentID != ""
+
+	if !childThread &&
+		threadID != "" {
+		root := m.rootThreadID(
+			threadID,
+		)
+
+		childThread =
+			root != "" &&
+				root != threadID
+	}
+
+	if method == "item/started" &&
+		threadID != "" {
 		m.setAgentMessageComplete(
 			threadID,
 			inbound.AccountID,
@@ -958,7 +1202,9 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 
 	if method == "item/completed" &&
 		threadID != "" &&
-		itemNotificationHasAgentMessage(message.Params) {
+		itemNotificationHasAgentMessage(
+			message.Params,
+		) {
 		m.setAgentMessageComplete(
 			threadID,
 			inbound.AccountID,
@@ -966,118 +1212,173 @@ func (m *Multiplexer) observeRecoveryNotification(inbound backend.Inbound) bool 
 		)
 	}
 
-	if method == "item/started" || method == "item/completed" {
-		if quotaChild := m.recordCollabLineage(message.Params); quotaChild != "" {
-			root := m.rootThreadID(quotaChild)
-			if root == "" {
-				root = m.rootThreadID(threadID)
-			}
+	if method == "item/started" ||
+		method == "item/completed" {
+		if quotaChild :=
+			m.recordCollabLineage(
+				message.Params,
+			); quotaChild != "" {
 			m.markAccountQuotaBlockedFor(
 				inbound.AccountID,
-				m.threadQuotaBucket(quotaChild, nil),
+				m.threadQuotaBucket(
+					quotaChild,
+					nil,
+				),
 			)
-			go m.recoverThreadTree(
-				root,
-				inbound.AccountID,
-				"subagent usage limit",
-				append([]byte(nil), inbound.Raw...),
-				true,
-			)
-			return true
 		}
 	}
 
 	if method == "thread/goal/updated" {
-		if limitedThread := parseUsageLimitedGoal(message.Params); limitedThread != "" {
+		if limitedThread :=
+			parseUsageLimitedGoal(
+				message.Params,
+			); limitedThread != "" {
 			m.markAccountQuotaBlockedFor(
 				inbound.AccountID,
-				m.threadQuotaBucket(limitedThread, nil),
+				m.threadQuotaBucket(
+					limitedThread,
+					nil,
+				),
 			)
-			go m.recoverThreadTree(
-				m.rootThreadID(limitedThread),
-				inbound.AccountID,
-				"thread goal usage limited",
-				append([]byte(nil), inbound.Raw...),
-				true,
-			)
-			return true
+
+			root :=
+				m.rootThreadID(
+					limitedThread,
+				)
+
+			if root != "" &&
+				root != limitedThread {
+				childThread = true
+			}
 		}
 	}
 
 	if method == "error" {
-		errorThread, willRetry, limited := parseErrorNotification(message.Params)
+		errorThread, _, limited :=
+			parseErrorNotification(
+				message.Params,
+			)
+
 		if limited {
 			m.markAccountQuotaBlockedFor(
 				inbound.AccountID,
-				m.threadQuotaBucket(errorThread, nil),
+				m.threadQuotaBucket(
+					errorThread,
+					nil,
+				),
 			)
-			if !willRetry && errorThread != "" {
-				go m.recoverThreadTree(
-					m.rootThreadID(errorThread),
-					inbound.AccountID,
-					"terminal usage-limit error",
-					append([]byte(nil), inbound.Raw...),
-					true,
+
+			root :=
+				m.rootThreadID(
+					errorThread,
 				)
-				return true
+
+			if root != "" &&
+				root != errorThread {
+				childThread = true
 			}
 		}
 	}
 
 	if method == "turn/completed" {
-		completedThread, explicitLimit := turnCompletedUsageLimit(message.Params)
+		completedThread, explicitLimit :=
+			turnCompletedUsageLimit(
+				message.Params,
+			)
+
 		if completedThread == "" {
-			completedThread, _ = silentCompletedTurn(message.Params)
+			completedThread, _ =
+				silentCompletedTurn(
+					message.Params,
+				)
 		}
+
 		if completedThread != "" {
-			root := m.rootThreadID(completedThread)
+			root := m.rootThreadID(
+				completedThread,
+			)
+
 			if root == "" {
 				root = completedThread
+			}
+
+			if root != completedThread {
+				childThread = true
 			}
 
 			if explicitLimit {
 				m.markAccountQuotaBlockedFor(
 					inbound.AccountID,
-					m.threadQuotaBucket(completedThread, nil),
+					m.threadQuotaBucket(
+						completedThread,
+						nil,
+					),
 				)
-				go m.recoverThreadTree(
-					root,
-					inbound.AccountID,
-					"turn completed at usage limit",
-					append([]byte(nil), inbound.Raw...),
-					true,
-				)
+
+				if root == completedThread {
+					go m.recoverThreadTree(
+						root,
+						inbound.AccountID,
+						"root turn completed at usage limit",
+						append(
+							[]byte(nil),
+							inbound.Raw...,
+						),
+						true,
+					)
+
+					return true
+				}
+			}
+
+			if root == completedThread {
+				if active, tracked :=
+					m.activeTurnFor(
+						completedThread,
+						inbound.AccountID,
+					); tracked &&
+					silentCompletionNeedsQuotaVerification(
+						active,
+						message.Params,
+					) {
+					go m.verifySilentCompletionAndRecover(
+						inbound,
+						root,
+					)
+
+					return true
+				}
+			}
+
+			if m.threadTreeRecovering(
+				root,
+			) {
 				return true
 			}
 
-			if active, tracked := m.activeTurnFor(
+			m.clearCompletedThreadTree(
 				completedThread,
 				inbound.AccountID,
-			); tracked &&
-				silentCompletionNeedsQuotaVerification(
-					active,
-					message.Params,
-				) {
-				go m.verifySilentCompletionAndRecover(
-					inbound,
-					root,
-				)
-				return true
-			}
-
-			// A terminal notification emitted by the old source while recovery is
-			// in progress must not clear the target's runtime state.
-			if m.threadTreeRecovering(root) {
-				return true
-			}
-
-			m.clearCompletedThreadTree(completedThread, inbound.AccountID)
+			)
 		}
 	}
 
-	if m.inboundSourceIsStale(inbound.AccountID, method, message.Params) {
+	// Child/subagent app-server threads are implementation details.
+	// The parent collaboration item is still forwarded normally, but the
+	// child's own thread/turn/item lifecycle must not masquerade as a new
+	// top-level conversation in the desktop renderer.
+	if childThread {
 		return true
 	}
+
+	if m.inboundSourceIsStale(
+		inbound.AccountID,
+		method,
+		message.Params,
+	) {
+		return true
+	}
+
 	return false
 }
 
@@ -1212,7 +1513,9 @@ func (m *Multiplexer) recoverStalledQuotaTurns() {
 		bucket    quotaBucket
 	}
 
-	roots := make(map[string]candidate)
+	roots := make(
+		map[string]candidate,
+	)
 
 	m.activeTurnMu.Lock()
 
@@ -1230,7 +1533,10 @@ func (m *Multiplexer) recoverStalledQuotaTurns() {
 			continue
 		}
 
-		root := m.rootThreadID(threadID)
+		root := m.rootThreadID(
+			threadID,
+		)
+
 		if root == "" {
 			root = threadID
 		}
@@ -1250,28 +1556,34 @@ func (m *Multiplexer) recoverStalledQuotaTurns() {
 	m.activeTurnMu.Unlock()
 
 	for _, entry := range roots {
-		ctx, cancel := context.WithTimeout(
-			context.Background(),
-			requestTimeout,
-		)
+		ctx, cancel :=
+			context.WithTimeout(
+				context.Background(),
+				requestTimeout,
+			)
 
-		snapshot, err := m.accountSnapshotWithProfile(
-			ctx,
-			entry.accountID,
-			false,
-		)
+		snapshot, err :=
+			m.accountSnapshotWithProfile(
+				ctx,
+				entry.accountID,
+				false,
+			)
+
 		cancel()
 
 		if err != nil {
 			continue
 		}
 
-		limits := rateLimitsForQuotaBucket(
-			snapshot,
-			entry.bucket,
-		)
+		limits :=
+			rateLimitsForQuotaBucket(
+				snapshot,
+				entry.bucket,
+			)
 
-		if rateLimitsHaveCapacity(limits) &&
+		if rateLimitsHaveCapacity(
+			limits,
+		) &&
 			!m.accountQuotaBlockedFor(
 				entry.accountID,
 				entry.bucket,
@@ -1279,17 +1591,12 @@ func (m *Multiplexer) recoverStalledQuotaTurns() {
 			continue
 		}
 
+		// Stalled does not mean terminal. Remember the exhausted account
+		// for future routing, but do not create another root while the
+		// existing source may still be executing commands.
 		m.markAccountQuotaBlockedFor(
 			entry.accountID,
 			entry.bucket,
-		)
-
-		go m.recoverThreadTree(
-			entry.threadID,
-			entry.accountID,
-			"stalled turn with exhausted quota",
-			nil,
-			true,
 		)
 	}
 }
@@ -1302,14 +1609,21 @@ func (m *Multiplexer) recoverThreadTree(
 	quota bool,
 ) {
 	root := m.rootThreadID(threadID)
+
 	if root == "" {
 		root = threadID
 	}
+
 	if root == "" {
 		return
 	}
 
-	active, ok := m.beginRecovery(root, sourceAccountID)
+	active, ok :=
+		m.beginRecovery(
+			root,
+			sourceAccountID,
+		)
+
 	if !ok {
 		return
 	}
@@ -1325,76 +1639,135 @@ func (m *Multiplexer) recoverThreadTree(
 			bucket,
 		)
 	}
-	m.markTreeSourceStale(root, sourceAccountID)
 
-	m.bestEffortInterruptTree(root, sourceAccountID)
+	m.markTreeSourceStale(
+		root,
+		sourceAccountID,
+	)
+
+	m.bestEffortInterruptTree(
+		root,
+		sourceAccountID,
+	)
+
 	m.terminateTrackedCommands(root)
-	time.Sleep(recoveryFlushDelay)
 
-	excluded := cloneAccountSet(active.excluded)
+	time.Sleep(
+		recoveryFlushDelay,
+	)
+
+	excluded :=
+		cloneAccountSet(
+			active.excluded,
+		)
+
 	if excluded == nil {
-		excluded = make(map[string]struct{})
-	}
-	if quota {
-		excluded[sourceAccountID] = struct{}{}
+		excluded =
+			make(map[string]struct{})
 	}
 
-	if err := m.performThreadRecovery(
+	if quota {
+		excluded[sourceAccountID] =
+			struct{}{}
+	}
+
+	err := m.performThreadRecovery(
 		root,
 		sourceAccountID,
 		active,
 		excluded,
 		cause,
 		!quota,
-	); err != nil {
-		if errors.Is(err, errNoSubscriptionCapacity) {
-			if m.setRecoveryParked(root, sourceAccountID, cause, failedRaw) {
-				m.publish(Event{
-					Type:      "thread-recovery-parked",
-					AccountID: sourceAccountID,
-					Message:   "Autonomous task parked until subscription capacity returns",
-					Data: map[string]any{
-						"threadId": root,
-						"cause":    cause,
-					},
-				})
-				go m.waitForParkedRecovery(root)
-			}
-			return
+	)
+
+	if err == nil {
+		return
+	}
+
+	if errors.Is(
+		err,
+		errNoSubscriptionCapacity,
+	) {
+		if m.setRecoveryParked(
+			root,
+			sourceAccountID,
+			cause,
+			failedRaw,
+			active.generation,
+		) {
+			m.publish(Event{
+				Type:      "thread-recovery-parked",
+				AccountID: sourceAccountID,
+				Message:   "Autonomous task parked until subscription capacity returns",
+				Data: map[string]any{
+					"threadId": root,
+					"cause":    cause,
+				},
+			})
+
+			go m.waitForParkedRecovery(
+				root,
+			)
 		}
 
-		m.setRecoveryFailed(root, sourceAccountID)
-		if len(failedRaw) > 0 {
-			m.writeRaw(failedRaw)
-		}
-		m.publish(Event{
-			Type:      "thread-recovery-failed",
-			AccountID: sourceAccountID,
-			Message:   fmt.Sprintf("Could not recover interrupted chat: %v", err),
-			Data: map[string]any{
-				"threadId": root,
-				"cause":    cause,
-			},
-		})
+		return
 	}
+
+	// If the user superseded this recovery, do not emit its obsolete
+	// failure and do not mutate the new turn.
+	if !m.setRecoveryFailed(
+		root,
+		sourceAccountID,
+		active.generation,
+	) {
+		return
+	}
+
+	if len(failedRaw) > 0 {
+		m.writeRaw(
+			failedRaw,
+		)
+	}
+
+	m.publish(Event{
+		Type:      "thread-recovery-failed",
+		AccountID: sourceAccountID,
+		Message: fmt.Sprintf(
+			"Could not recover interrupted chat: %v",
+			err,
+		),
+		Data: map[string]any{
+			"threadId": root,
+			"cause":    cause,
+		},
+	})
 }
 
-func (m *Multiplexer) waitForParkedRecovery(root string) {
+func (m *Multiplexer) waitForParkedRecovery(
+	root string,
+) {
 	for {
 		ctx := m.runCtx
+
 		if ctx == nil {
 			ctx = context.Background()
 		}
 
-		timer := time.NewTimer(recoveryRetryInterval)
+		timer := time.NewTimer(
+			recoveryRetryInterval,
+		)
+
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+
 		case <-timer.C:
 		}
 
-		active, ok := m.claimParkedRecovery(root)
+		active, ok :=
+			m.claimParkedRecovery(root)
+
 		if !ok {
 			return
 		}
@@ -1407,25 +1780,40 @@ func (m *Multiplexer) waitForParkedRecovery(root string) {
 			"capacity returned after parked quota failure",
 			true,
 		)
+
 		if err == nil {
 			return
 		}
 
-		if errors.Is(err, errNoSubscriptionCapacity) {
-			m.activeTurnMu.Lock()
-			current := m.activeTurns[root]
-			current.recovering = false
-			current.parked = true
-			current.lastActivity = m.now()
-			m.activeTurns[root] = current
-			m.activeTurnMu.Unlock()
+		if errors.Is(
+			err,
+			errNoSubscriptionCapacity,
+		) {
+			// Re-park only if this exact retry generation is still current.
+			if !m.setRecoveryParked(
+				root,
+				active.accountID,
+				active.recoveryCause,
+				active.failureRaw,
+				active.generation,
+			) {
+				return
+			}
+
 			continue
 		}
 
-		m.setRecoveryFailed(root, active.accountID)
-		if len(active.failureRaw) > 0 {
-			m.writeRaw(active.failureRaw)
+		if m.setRecoveryFailed(
+			root,
+			active.accountID,
+			active.generation,
+		) &&
+			len(active.failureRaw) > 0 {
+			m.writeRaw(
+				active.failureRaw,
+			)
 		}
+
 		return
 	}
 }
@@ -1438,7 +1826,16 @@ func (m *Multiplexer) performThreadRecovery(
 	cause string,
 	preferSource bool,
 ) error {
+	if !m.recoveryLeaseCurrent(
+		root,
+		sourceAccountID,
+		active.generation,
+	) {
+		return nil
+	}
+
 	tried := cloneAccountSet(excluded)
+
 	if tried == nil {
 		tried = make(map[string]struct{})
 	}
@@ -1449,47 +1846,78 @@ func (m *Multiplexer) performThreadRecovery(
 	)
 
 	var candidates []state.Account
+
 	if preferSource {
-		if source, ok := m.store.Account(sourceAccountID); ok && source.Enabled &&
+		if source, ok :=
+			m.store.Account(
+				sourceAccountID,
+			); ok &&
+			source.Enabled &&
 			!m.accountQuotaBlockedFor(
 				sourceAccountID,
 				bucket,
 			) {
-			candidates = append(candidates, source)
+			candidates = append(
+				candidates,
+				source,
+			)
 		}
 	}
 
-	for attempts := 0; attempts < len(m.store.Accounts())+2; attempts++ {
+	for attempts := 0; attempts <
+		len(m.store.Accounts())+2; attempts++ {
+		if !m.recoveryLeaseCurrent(
+			root,
+			sourceAccountID,
+			active.generation,
+		) {
+			return nil
+		}
+
 		var target state.Account
 
 		if len(candidates) > 0 {
 			target = candidates[0]
 			candidates = candidates[1:]
-			if _, already := tried[target.ID]; already {
+
+			if _, already :=
+				tried[target.ID]; already {
 				continue
 			}
 		} else {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-			fallback, _, selectedBucket, err := m.chooseAccountWithReserveFallback(
-				ctx,
-				tried,
-				bucket,
-			)
+			ctx, cancel :=
+				context.WithTimeout(
+					context.Background(),
+					2*requestTimeout,
+				)
+
+			fallback, _, selectedBucket, err :=
+				m.chooseAccountWithReserveFallback(
+					ctx,
+					tried,
+					bucket,
+				)
+
 			cancel()
+
 			if err != nil {
 				return err
 			}
+
 			if selectedBucket != bucket {
 				bucket = selectedBucket
 
-				// Start a fresh candidate set for the independently metered Reserve
-				// allowance.
-				tried = make(map[string]struct{})
+				// Reserve is independently metered, so normal-quota
+				// exclusions do not carry into its candidate pool.
+				tried =
+					make(map[string]struct{})
 
-				updatedParams, paramErr := paramsForQuotaBucket(
-					active.params,
-					bucket,
-				)
+				updatedParams, paramErr :=
+					paramsForQuotaBucket(
+						active.params,
+						bucket,
+					)
+
 				if paramErr != nil {
 					return fmt.Errorf(
 						"switch recovery to Luna Reserve: %w",
@@ -1497,7 +1925,8 @@ func (m *Multiplexer) performThreadRecovery(
 					)
 				}
 
-				active.params = updatedParams
+				active.params =
+					updatedParams
 
 				m.rememberThreadQuotaBucket(
 					root,
@@ -1511,11 +1940,33 @@ func (m *Multiplexer) performThreadRecovery(
 		if target.ID == "" {
 			continue
 		}
-		tried[target.ID] = struct{}{}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-		err := m.resumeThreadOnAccount(ctx, root, sourceAccountID, target.ID)
+		tried[target.ID] =
+			struct{}{}
+
+		if !m.recoveryLeaseCurrent(
+			root,
+			sourceAccountID,
+			active.generation,
+		) {
+			return nil
+		}
+
+		ctx, cancel :=
+			context.WithTimeout(
+				context.Background(),
+				2*requestTimeout,
+			)
+
+		err := m.resumeThreadOnAccount(
+			ctx,
+			root,
+			sourceAccountID,
+			target.ID,
+		)
+
 		cancel()
+
 		if err != nil {
 			fmt.Fprintf(
 				os.Stderr,
@@ -1525,58 +1976,154 @@ func (m *Multiplexer) performThreadRecovery(
 				target.ID,
 				err,
 			)
+
 			continue
 		}
 
-		params, err := continuationTurnParams(active.params, root)
+		if !m.recoveryLeaseCurrent(
+			root,
+			sourceAccountID,
+			active.generation,
+		) {
+			return nil
+		}
+
+		params, err :=
+			continuationTurnParams(
+				active.params,
+				root,
+			)
+
 		if err != nil {
 			return err
 		}
 
-		targetChild, ok := m.child(target.ID)
+		targetChild, ok :=
+			m.child(target.ID)
+
 		if !ok {
 			continue
 		}
 
-		// A genuine new recovery turn is about to start.
-		// Clear terminal-output state BEFORE Request so a fast target response
-		// can safely set it again.
+		// Validate and update terminal-message state atomically with the
+		// same generation lease immediately before turn/start.
 		m.activeTurnMu.Lock()
-		current := m.activeTurns[root]
-		current.agentMessageComplete = false
-		m.activeTurns[root] = current
+
+		current, currentOK :=
+			m.activeTurns[root]
+
+		leaseOK :=
+			currentOK &&
+				current.accountID ==
+					sourceAccountID &&
+				current.recovering &&
+				!current.parked &&
+				current.generation ==
+					active.generation
+
+		if leaseOK {
+			current.agentMessageComplete =
+				false
+			m.activeTurns[root] =
+				current
+		}
+
 		m.activeTurnMu.Unlock()
 
-		ctx, cancel = context.WithTimeout(context.Background(), 2*requestTimeout)
-		response, startErr := targetChild.Request(ctx, "turn/start", params)
+		if !leaseOK {
+			return nil
+		}
+
+		ctx, cancel =
+			context.WithTimeout(
+				context.Background(),
+				2*requestTimeout,
+			)
+
+		response, startErr :=
+			targetChild.Request(
+				ctx,
+				"turn/start",
+				params,
+			)
+
 		cancel()
 
-		if startErr != nil && strings.Contains(strings.ToLower(startErr.Error()), "active turn") {
-			// One bounded cleanup attempt for a thread that the target still
-			// considers active. Repeated interrupts are intentionally avoided.
-			interruptParams, _ := json.Marshal(map[string]any{
-				"threadId": root,
-				"turnId":   "",
-			})
-			interruptCtx, interruptCancel := context.WithTimeout(
-				context.Background(),
-				recoveryInterruptWindow,
+		if startErr != nil &&
+			strings.Contains(
+				strings.ToLower(
+					startErr.Error(),
+				),
+				"active turn",
+			) {
+			// Do not interrupt something on the target if a newer user
+			// generation superseded this recovery while Request was
+			// in flight.
+			if !m.recoveryLeaseCurrent(
+				root,
+				sourceAccountID,
+				active.generation,
+			) {
+				return nil
+			}
+
+			interruptParams, _ :=
+				json.Marshal(
+					map[string]any{
+						"threadId": root,
+						"turnId":   "",
+					},
+				)
+
+			interruptCtx,
+				interruptCancel :=
+				context.WithTimeout(
+					context.Background(),
+					recoveryInterruptWindow,
+				)
+
+			_, _ = targetChild.Request(
+				interruptCtx,
+				"turn/interrupt",
+				interruptParams,
 			)
-			_, _ = targetChild.Request(interruptCtx, "turn/interrupt", interruptParams)
+
 			interruptCancel()
 
-			retryCtx, retryCancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-			response, startErr = targetChild.Request(retryCtx, "turn/start", params)
+			if !m.recoveryLeaseCurrent(
+				root,
+				sourceAccountID,
+				active.generation,
+			) {
+				return nil
+			}
+
+			retryCtx, retryCancel :=
+				context.WithTimeout(
+					context.Background(),
+					2*requestTimeout,
+				)
+
+			response, startErr =
+				targetChild.Request(
+					retryCtx,
+					"turn/start",
+					params,
+				)
+
 			retryCancel()
 		}
 
 		if startErr != nil {
-			if usageLimitText(startErr.Error()) {
+			if usageLimitText(
+				startErr.Error(),
+			) {
 				m.markAccountQuotaBlockedFor(
 					target.ID,
 					bucket,
 				)
 			}
+
 			fmt.Fprintf(
 				os.Stderr,
 				"codex-mux: recover %s: continuation on %s failed: %v\n",
@@ -1584,30 +2131,60 @@ func (m *Multiplexer) performThreadRecovery(
 				target.ID,
 				startErr,
 			)
+
 			continue
 		}
 
-		turnID := turnIDFromTurnStartResult(response.Result)
-		if err := m.store.SetThreadOwner(root, target.ID); err != nil {
-			return err
+		turnID :=
+			turnIDFromTurnStartResult(
+				response.Result,
+			)
+
+		// Commit owner + recovery state under the same generation lease.
+		// This is the serialization point shared with user turn/start.
+		committed, commitErr :=
+			m.setRecoverySucceeded(
+				root,
+				sourceAccountID,
+				target.ID,
+				turnID,
+				active.params,
+				nil,
+				active.generation,
+			)
+
+		if commitErr != nil {
+			m.interruptRecoveryTarget(
+				target.ID,
+				root,
+				turnID,
+			)
+
+			return commitErr
 		}
 
-		// Keep the original durable task/model state. `params` contains the
-		// synthetic "Continue the interrupted task..." input and must never
-		// become the next recovery's source task.
-		m.setRecoverySucceeded(
+		if !committed {
+			m.interruptRecoveryTarget(
+				target.ID,
+				root,
+				turnID,
+			)
+
+			return nil
+		}
+
+		m.clearStaleSource(
 			root,
 			target.ID,
-			turnID,
-			active.params,
-			nil,
 		)
-		m.clearStaleSource(root, target.ID)
 
 		m.publish(Event{
 			Type:      "thread-autonomous-failed-over",
 			AccountID: target.ID,
-			Message:   fmt.Sprintf("Chat continued with %s", target.Label),
+			Message: fmt.Sprintf(
+				"Chat continued with %s",
+				target.Label,
+			),
 			Data: map[string]any{
 				"threadId":          root,
 				"previousAccountId": sourceAccountID,
@@ -1623,8 +2200,10 @@ func (m *Multiplexer) performThreadRecovery(
 			target.ID,
 			cause,
 		)
+
 		return nil
 	}
+
 	return errNoSubscriptionCapacity
 }
 

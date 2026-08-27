@@ -18,10 +18,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/b-nnett/codex-subscription-router/internal/control"
-	"github.com/b-nnett/codex-subscription-router/internal/mux"
-	"github.com/b-nnett/codex-subscription-router/internal/protocol"
-	"github.com/b-nnett/codex-subscription-router/internal/state"
+	"github.com/tomyteeee/Codex-Router/internal/control"
+	"github.com/tomyteeee/Codex-Router/internal/mux"
+	"github.com/tomyteeee/Codex-Router/internal/protocol"
+	"github.com/tomyteeee/Codex-Router/internal/state"
 )
 
 const defaultControlPort = 48123

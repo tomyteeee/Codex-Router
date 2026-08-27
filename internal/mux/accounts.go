@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/b-nnett/codex-subscription-router/internal/state"
+	"github.com/tomyteeee/Codex-Router/internal/state"
 )
 
 var errNoSubscriptionCapacity = errors.New("no enabled ChatGPT subscription has capacity")
