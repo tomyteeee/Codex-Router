@@ -61,6 +61,9 @@ type RouteReason struct {
 	BankedResetCount     *int     `json:"bankedResetCount,omitempty"`
 	ResetCreditExpiresAt *int64   `json:"resetCreditExpiresAt,omitempty"`
 	UrgencyScore         *float64 `json:"urgencyScore,omitempty"`
+	ShortResetsAt        *int64   `json:"shortResetsAt,omitempty"`
+	PacingScore          *float64 `json:"pacingScore,omitempty"`
+	PacingDriver         string   `json:"pacingDriver,omitempty"`
 	ThreadCount          int      `json:"threadCount"`
 }
 
@@ -275,6 +278,8 @@ func (m *Multiplexer) chooseAccountForQuotaBucket(
 		shortUsed    float64
 		resetCredits resetCreditMetadata
 		urgency      float64
+		limits       *RateLimits
+		pacing       quotaPacingState
 	}
 
 	candidates := make([]candidate, 0, len(snapshots))
@@ -342,6 +347,11 @@ func (m *Multiplexer) chooseAccountForQuotaBucket(
 		if short != nil {
 			shortUsed = short.UsedPercent
 			reason.ShortUsedPercent = &short.UsedPercent
+
+			if short.ResetsAt != nil {
+				value := *short.ResetsAt
+				reason.ShortResetsAt = &value
+			}
 		}
 
 		candidates = append(candidates, candidate{
@@ -350,6 +360,7 @@ func (m *Multiplexer) chooseAccountForQuotaBucket(
 			weekly:     weekly,
 			weeklyUsed: weeklyUsed,
 			shortUsed:  shortUsed,
+			limits:     limits,
 		})
 	}
 
@@ -421,8 +432,45 @@ func (m *Multiplexer) chooseAccountForQuotaBucket(
 		}
 	}
 
+	if bucket == quotaBucketNormal {
+		routingNow := time.Now()
+
+		if m.now != nil {
+			routingNow = m.now()
+		}
+
+		for index := range candidates {
+			candidates[index].pacing =
+				quotaPacingStateForLimits(
+					routingNow,
+					candidates[index].limits,
+					candidates[index].resetCredits,
+				)
+
+			score := candidates[index].pacing.desirability
+			candidates[index].reason.PacingScore = &score
+			candidates[index].reason.PacingDriver =
+				quotaRoutingDriver(
+					candidates[index].pacing,
+				)
+		}
+	}
+
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
+
+		if bucket == quotaBucketNormal {
+			switch compareQuotaPacingSelection(
+				left.pacing,
+				right.pacing,
+			) {
+			case 1:
+				return true
+
+			case -1:
+				return false
+			}
+		}
 
 		if math.Abs(left.urgency-right.urgency) > 0.000001 {
 			return left.urgency > right.urgency

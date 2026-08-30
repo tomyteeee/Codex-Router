@@ -3,160 +3,21 @@ package mux
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"time"
 )
 
 const (
 	quotaBalanceInterval      = 60 * time.Second
-	quotaRebalanceMinGap      = 15.0
 	quotaRebalanceCooldown    = 5 * time.Minute
 	quotaRebalanceBoundaryLag = 100 * time.Millisecond
-
-	quotaRebalanceShortGuard  = 80.0
-	quotaRebalanceWeeklyGuard = 90.0
-	quotaRebalanceGuardGap    = 8.0
 )
-
-type quotaPressure struct {
-	combined float64
-	short    float64
-	weekly   float64
-}
 
 type quotaRebalancePlan struct {
 	root       string
 	source     string
 	target     string
 	generation uint64
-}
-
-func clampQuotaPercent(value float64) float64 {
-	return math.Max(
-		0,
-		math.Min(
-			100,
-			value,
-		),
-	)
-}
-
-func quotaPressureForSnapshot(
-	snapshot AccountSnapshot,
-) (
-	quotaPressure,
-	bool,
-	bool,
-) {
-	if !snapshot.Enabled ||
-		!snapshot.Connected ||
-		snapshot.AuthType != "chatgpt" ||
-		snapshot.RateLimits == nil {
-		return quotaPressure{},
-			false,
-			false
-	}
-
-	weekly, short :=
-		longestAndShortestWindow(
-			snapshot.RateLimits,
-		)
-
-	pressure := quotaPressure{}
-
-	if short != nil {
-		pressure.short =
-			clampQuotaPercent(
-				short.UsedPercent,
-			)
-	}
-
-	if weekly != nil {
-		pressure.weekly =
-			clampQuotaPercent(
-				weekly.UsedPercent,
-			)
-	}
-
-	pressure.combined =
-		math.Max(
-			pressure.short,
-			pressure.weekly,
-		)
-
-	usable :=
-		rateLimitsHaveCapacity(
-			snapshot.RateLimits,
-		)
-
-	return pressure,
-		usable,
-		true
-}
-
-func shouldQuotaRebalance(
-	source quotaPressure,
-	target quotaPressure,
-) bool {
-	if source.combined-
-		target.combined >=
-		quotaRebalanceMinGap {
-		return true
-	}
-
-	if source.short >=
-		quotaRebalanceShortGuard &&
-		source.short-target.short >=
-			quotaRebalanceGuardGap {
-		return true
-	}
-
-	if source.weekly >=
-		quotaRebalanceWeeklyGuard &&
-		source.weekly-target.weekly >=
-			quotaRebalanceGuardGap {
-		return true
-	}
-
-	return false
-}
-
-func betterQuotaRebalanceTarget(
-	candidateID string,
-	candidate quotaPressure,
-	currentID string,
-	current quotaPressure,
-) bool {
-	if currentID == "" {
-		return true
-	}
-
-	if math.Abs(
-		candidate.combined-
-			current.combined,
-	) > 0.001 {
-		return candidate.combined <
-			current.combined
-	}
-
-	if math.Abs(
-		candidate.short-
-			current.short,
-	) > 0.001 {
-		return candidate.short <
-			current.short
-	}
-
-	if math.Abs(
-		candidate.weekly-
-			current.weekly,
-	) > 0.001 {
-		return candidate.weekly <
-			current.weekly
-	}
-
-	return candidateID < currentID
 }
 
 func (m *Multiplexer) quotaRebalanceNow() time.Time {
@@ -197,42 +58,54 @@ func (m *Multiplexer) quotaBalanceLoop(
 	}
 }
 
-func (m *Multiplexer) planQuotaRebalances(
+func (m *Multiplexer) quotaPacingStates(
 	ctx context.Context,
-) {
+) map[string]quotaPacingState {
 	snapshots :=
 		m.accountSnapshots(
 			ctx,
 			false,
 		)
 
-	type quotaState struct {
-		pressure quotaPressure
-		usable   bool
-	}
+	now :=
+		m.quotaRebalanceNow()
 
 	states :=
 		make(
-			map[string]quotaState,
+			map[string]quotaPacingState,
 			len(snapshots),
 		)
 
 	for _, snapshot := range snapshots {
-		pressure, usable, known :=
-			quotaPressureForSnapshot(
-				snapshot,
-			)
-
-		if !known {
+		if !snapshot.Enabled ||
+			!snapshot.Connected ||
+			snapshot.AuthType !=
+				"chatgpt" ||
+			snapshot.RateLimits == nil {
 			continue
 		}
 
+		state :=
+			quotaPacingStateForLimits(
+				now,
+				snapshot.RateLimits,
+				resetCreditMetadata{},
+			)
+
 		states[snapshot.ID] =
-			quotaState{
-				pressure: pressure,
-				usable:   usable,
-			}
+			state
 	}
+
+	return states
+}
+
+func (m *Multiplexer) planQuotaRebalances(
+	ctx context.Context,
+) {
+	states :=
+		m.quotaPacingStates(
+			ctx,
+		)
 
 	m.activeTurnMu.Lock()
 
@@ -249,7 +122,8 @@ func (m *Multiplexer) planQuotaRebalances(
 
 	m.activeTurnMu.Unlock()
 
-	now := m.quotaRebalanceNow()
+	now :=
+		m.quotaRebalanceNow()
 
 	for threadID, active := range activeCopy {
 		root :=
@@ -314,10 +188,11 @@ func (m *Multiplexer) planQuotaRebalances(
 			continue
 		}
 
-		sourceState, sourceKnown :=
+		source, known :=
 			states[active.accountID]
 
-		if !sourceKnown {
+		if !known ||
+			!source.usable {
 			m.clearPlannedQuotaRebalance(
 				root,
 				active.accountID,
@@ -326,9 +201,10 @@ func (m *Multiplexer) planQuotaRebalances(
 			continue
 		}
 
-		bestID := ""
-		bestPressure :=
-			quotaPressure{}
+		eligible :=
+			make(
+				map[string]quotaPacingState,
+			)
 
 		for accountID, state := range states {
 			if accountID ==
@@ -341,24 +217,19 @@ func (m *Multiplexer) planQuotaRebalances(
 				continue
 			}
 
-			if betterQuotaRebalanceTarget(
-				accountID,
-				state.pressure,
-				bestID,
-				bestPressure,
-			) {
-				bestID =
-					accountID
-				bestPressure =
-					state.pressure
-			}
+			eligible[accountID] =
+				state
 		}
 
-		if bestID == "" ||
-			!shouldQuotaRebalance(
-				sourceState.pressure,
-				bestPressure,
-			) {
+		targetID, decision :=
+			bestQuotaMigrationTarget(
+				active.accountID,
+				source,
+				eligible,
+			)
+
+		if targetID == "" ||
+			!decision.migrate {
 			m.clearPlannedQuotaRebalance(
 				root,
 				active.accountID,
@@ -367,12 +238,31 @@ func (m *Multiplexer) planQuotaRebalances(
 			continue
 		}
 
-		m.setPlannedQuotaRebalance(
+		target :=
+			eligible[targetID]
+
+		if m.setPlannedQuotaRebalance(
 			root,
 			active.accountID,
 			active.generation,
-			bestID,
-		)
+			targetID,
+		) {
+			fmt.Fprintf(
+				os.Stderr,
+				"codex-mux: quota rebalance planned thread=%s source=%s target=%s reason=%s advantage=%.3f source={%s} target={%s}\n",
+				root,
+				active.accountID,
+				targetID,
+				decision.reason,
+				decision.advantage,
+				quotaPacingSummary(
+					source,
+				),
+				quotaPacingSummary(
+					target,
+				),
+			)
+		}
 	}
 }
 
@@ -381,12 +271,12 @@ func (m *Multiplexer) setPlannedQuotaRebalance(
 	source string,
 	generation uint64,
 	target string,
-) {
+) bool {
 	if root == "" ||
 		source == "" ||
 		target == "" ||
 		source == target {
-		return
+		return false
 	}
 
 	m.activeTurnMu.Lock()
@@ -401,7 +291,12 @@ func (m *Multiplexer) setPlannedQuotaRebalance(
 		active.recovering ||
 		active.parked ||
 		active.agentMessageComplete {
-		return
+		return false
+	}
+
+	if active.rebalanceTarget ==
+		target {
+		return false
 	}
 
 	active.rebalanceTarget =
@@ -409,6 +304,8 @@ func (m *Multiplexer) setPlannedQuotaRebalance(
 
 	m.activeTurns[root] =
 		active
+
+	return true
 }
 
 func (m *Multiplexer) clearPlannedQuotaRebalance(
@@ -719,59 +616,46 @@ func (m *Multiplexer) quotaRebalanceTreeIdle(
 func (m *Multiplexer) validateQuotaRebalancePlan(
 	ctx context.Context,
 	plan quotaRebalancePlan,
-) bool {
-	snapshots :=
-		m.accountSnapshots(
+) (
+	quotaMigrationDecision,
+	quotaPacingState,
+	quotaPacingState,
+	bool,
+) {
+	states :=
+		m.quotaPacingStates(
 			ctx,
-			false,
 		)
 
-	var sourcePressure quotaPressure
-	var targetPressure quotaPressure
+	source, sourceKnown :=
+		states[plan.source]
 
-	sourceKnown := false
-	targetKnown := false
-	targetUsable := false
-
-	for _, snapshot := range snapshots {
-		pressure, usable, known :=
-			quotaPressureForSnapshot(
-				snapshot,
-			)
-
-		if !known {
-			continue
-		}
-
-		switch snapshot.ID {
-		case plan.source:
-			sourcePressure =
-				pressure
-			sourceKnown = true
-
-		case plan.target:
-			targetPressure =
-				pressure
-			targetKnown = true
-			targetUsable =
-				usable
-		}
-	}
+	target, targetKnown :=
+		states[plan.target]
 
 	if !sourceKnown ||
 		!targetKnown ||
-		!targetUsable ||
+		!target.usable ||
 		m.accountQuotaBlockedFor(
 			plan.target,
 			quotaBucketNormal,
 		) {
-		return false
+		return quotaMigrationDecision{},
+			source,
+			target,
+			false
 	}
 
-	return shouldQuotaRebalance(
-		sourcePressure,
-		targetPressure,
-	)
+	decision :=
+		quotaRebalanceDecision(
+			source,
+			target,
+		)
+
+	return decision,
+		source,
+		target,
+		decision.migrate
 }
 
 func (m *Multiplexer) quotaRebalanceExclusions(
@@ -794,10 +678,18 @@ func (m *Multiplexer) quotaRebalanceExclusions(
 	return excluded
 }
 
+func shouldRetryQuotaRebalanceWithNormalPool(
+	err error,
+) bool {
+	return err != nil
+}
+
 func (m *Multiplexer) noteQuotaRebalanceFinished(
 	root string,
 	source string,
 	expectedGeneration uint64,
+	reason string,
+	advantage float64,
 ) {
 	m.activeTurnMu.Lock()
 
@@ -830,10 +722,12 @@ func (m *Multiplexer) noteQuotaRebalanceFinished(
 		target != source {
 		fmt.Fprintf(
 			os.Stderr,
-			"codex-mux: proactively rebalanced autonomous thread %s %s -> %s\n",
+			"codex-mux: proactively rebalanced autonomous thread %s %s -> %s reason=%s advantage=%.3f\n",
 			root,
 			source,
 			target,
+			reason,
+			advantage,
 		)
 	}
 }
@@ -847,7 +741,10 @@ func (m *Multiplexer) executeQuotaRebalance(
 			2*requestTimeout,
 		)
 
-	valid :=
+	decision,
+		sourceState,
+		targetState,
+		valid :=
 		m.validateQuotaRebalancePlan(
 			ctx,
 			plan,
@@ -856,6 +753,19 @@ func (m *Multiplexer) executeQuotaRebalance(
 	cancel()
 
 	if !valid {
+		fmt.Fprintf(
+			os.Stderr,
+			"codex-mux: quota rebalance suppressed thread=%s source=%s target=%s reason=STALE_OR_NO_LONGER_BETTER source={%s} target={%s}\n",
+			plan.root,
+			plan.source,
+			plan.target,
+			quotaPacingSummary(
+				sourceState,
+			),
+			quotaPacingSummary(
+				targetState,
+			),
+		)
 		return
 	}
 
@@ -891,9 +801,6 @@ func (m *Multiplexer) executeQuotaRebalance(
 		return
 	}
 
-	// Unlike hard quota recovery, proactive balancing only reaches this
-	// point when the tree has no active child agents and no tracked shell
-	// commands. Do not terminate commands here.
 	m.markTreeSourceStale(
 		plan.root,
 		plan.source,
@@ -919,26 +826,25 @@ func (m *Multiplexer) executeQuotaRebalance(
 			plan.source,
 			active,
 			targetOnly,
-			"proactive quota rebalance",
+			"proactive reset-aware quota rebalance",
 			false,
 		)
 
-	if err != nil &&
+	if shouldRetryQuotaRebalanceWithNormalPool(
+		err,
+	) &&
 		m.recoveryLeaseCurrent(
 			plan.root,
 			plan.source,
 			active.generation,
 		) {
-		// A proactive handoff must never sacrifice continuity. If the chosen
-		// target became unavailable after the quota snapshot, recover again
-		// with the normal candidate pool, preferring the original source.
 		err =
 			m.performThreadRecovery(
 				plan.root,
 				plan.source,
 				active,
 				nil,
-				"proactive quota rebalance fallback",
+				"proactive reset-aware quota rebalance fallback",
 				true,
 			)
 	}
@@ -952,7 +858,7 @@ func (m *Multiplexer) executeQuotaRebalance(
 			m.setRecoveryParked(
 				plan.root,
 				plan.source,
-				"proactive quota rebalance retry",
+				"proactive reset-aware quota rebalance retry",
 				nil,
 				active.generation,
 			) {
@@ -968,5 +874,7 @@ func (m *Multiplexer) executeQuotaRebalance(
 		plan.root,
 		plan.source,
 		active.generation,
+		decision.reason,
+		decision.advantage,
 	)
 }
