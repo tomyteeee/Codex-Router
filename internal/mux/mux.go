@@ -189,42 +189,18 @@ func (m *Multiplexer) chooseAccountWithReserveFallback(
 	quotaBucket,
 	error,
 ) {
+	// Automatic Luna Reserve fallback is intentionally disabled.
+	//
+	// Route only within the quota bucket explicitly requested by the turn.
+	// In particular, exhausting normal Codex capacity must never rewrite
+	// the turn to gpt-reserve.
 	account, reason, err := m.chooseAccountForQuotaBucket(
 		ctx,
 		excluded,
 		bucket,
 	)
 
-	if err == nil {
-		return account, reason, bucket, nil
-	}
-
-	if bucket != quotaBucketNormal ||
-		!errors.Is(err, errNoSubscriptionCapacity) {
-		return state.Account{}, reason, bucket, err
-	}
-
-	// Normal quota exclusions must not leak into the separately metered
-	// Reserve pool. In particular, an account whose 5h or weekly normal
-	// allowance is exhausted may still have completely usable Reserve.
-	reserveAccount, reserveReason, reserveErr :=
-		m.chooseAccountForQuotaBucket(
-			ctx,
-			nil,
-			quotaBucketReserve,
-		)
-
-	if reserveErr != nil {
-		return state.Account{},
-			reserveReason,
-			quotaBucketReserve,
-			reserveErr
-	}
-
-	return reserveAccount,
-		reserveReason,
-		quotaBucketReserve,
-		nil
+	return account, reason, bucket, err
 }
 
 func quotaBlockKey(
