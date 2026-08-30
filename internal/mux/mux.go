@@ -49,6 +49,11 @@ type activeTurn struct {
 	recoveryCause        string
 	failureRaw           []byte
 	agentMessageComplete bool
+
+	// Proactive quota balancing is deliberately separate from emergency
+	// recovery. A target is only acted on at a safe autonomous boundary.
+	rebalanceTarget string
+	lastRebalance   time.Time
 }
 
 type quotaBucket string
@@ -189,18 +194,50 @@ func (m *Multiplexer) chooseAccountWithReserveFallback(
 	quotaBucket,
 	error,
 ) {
-	// Automatic Luna Reserve fallback is intentionally disabled.
-	//
-	// Route only within the quota bucket explicitly requested by the turn.
-	// In particular, exhausting normal Codex capacity must never rewrite
-	// the turn to gpt-reserve.
+	const lunaReserveFallbackEnabled = false
+
 	account, reason, err := m.chooseAccountForQuotaBucket(
 		ctx,
 		excluded,
 		bucket,
 	)
 
-	return account, reason, bucket, err
+	if err == nil {
+		return account, reason, bucket, nil
+	}
+
+	if !lunaReserveFallbackEnabled ||
+		bucket != quotaBucketNormal ||
+		!errors.Is(err, errNoSubscriptionCapacity) {
+		return state.Account{}, reason, bucket, err
+	}
+
+	// Reference implementation only.
+	//
+	// When enabled, normal Codex exhaustion falls back to the separately
+	// metered gpt-reserve allowance. This is currently disabled because
+	// Reserve does not work correctly with autonomous subagent execution.
+	//
+	// Normal quota exclusions intentionally do not carry into Reserve,
+	// because the two quota domains are independently metered.
+	reserveAccount, reserveReason, reserveErr :=
+		m.chooseAccountForQuotaBucket(
+			ctx,
+			nil,
+			quotaBucketReserve,
+		)
+
+	if reserveErr != nil {
+		return state.Account{},
+			reserveReason,
+			quotaBucketReserve,
+			reserveErr
+	}
+
+	return reserveAccount,
+		reserveReason,
+		quotaBucketReserve,
+		nil
 }
 
 func quotaBlockKey(
@@ -450,6 +487,7 @@ func (m *Multiplexer) Start(ctx context.Context) error {
 	go m.primeInitialQuotaState(ctx)
 	go m.syncManagedConfigLoop(ctx)
 	go m.recoveryWatchLoop(ctx)
+	go m.quotaBalanceLoop(ctx)
 	return nil
 }
 
@@ -873,6 +911,7 @@ func (m *Multiplexer) rememberActiveTurn(
 	active.failureRaw = nil
 	active.recoveryCause = ""
 	active.agentMessageComplete = false
+	active.rebalanceTarget = ""
 
 	m.activeTurns[threadID] = active
 	m.activeTurnMu.Unlock()

@@ -413,6 +413,7 @@ func (m *Multiplexer) supersedeRecoveryForUserTurn(
 	active.parked = false
 	active.recoveryCause = ""
 	active.failureRaw = nil
+	active.rebalanceTarget = ""
 	active.lastActivity = m.now()
 
 	m.activeTurns[root] = active
@@ -1226,6 +1227,14 @@ func (m *Multiplexer) observeRecoveryNotification(
 				),
 			)
 		}
+	}
+
+	if method == "item/completed" &&
+		threadID != "" {
+		m.scheduleQuotaRebalanceBoundary(
+			threadID,
+			inbound.AccountID,
+		)
 	}
 
 	if method == "thread/goal/updated" {
