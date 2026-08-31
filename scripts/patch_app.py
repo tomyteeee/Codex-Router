@@ -51,7 +51,7 @@ TESTED_SOURCE_BUILDS = {
         "7019",
     ): "76bbcdc2a4a2d77cfe03904a6537d0a655f9892f27a8925e3a6c7b613801d4cf",
 }
-EXPECTED_CUA_IDENTIFIER_REPLACEMENTS = 99
+EXPECTED_CUA_IDENTIFIER_REPLACEMENTS = 49
 EXPECTED_ASAR_CUA_IDENTIFIER_REPLACEMENTS = 16
 
 
@@ -893,6 +893,28 @@ def patch_renderer(
         open_change_anchors = (
             "triggerButton:Dt,onOpenChange:l,children:N",
         )
+    elif source_build == ("26.825.51511", "7377"):
+        component_anchor = (
+            "function jwc(e){let t=(0,Iwc.c)(235),"
+            "{sidebarFooter:n,triggerButton:r}=e"
+        )
+        component_identifier_replacements = {
+            "d7": "u8",
+            "Esc": "Lwc",
+        }
+        component_jsx_alias = "u8"
+        plugin_rpc_mapping_anchors = (
+            "Nb(e,n).sendRequest(`app/list`,{cursor:i,limit:isr,forceRefetch:t},{trace:a})",
+            "Nb(e,n).sendRequest(`app/installed`,t?{forceRefresh:!0}:{})",
+            "map(t=>Nb(e,n).sendRequest(`app/read`,{appIds:t}))",
+            '"mcpServer/oauth/login":`mcp`',
+            "listMcpServers(e,t){let n=JSON.stringify({options:t,params:e})",
+            "let i=this.sendRequest(`mcpServerStatus/list`,e,t);",
+        )
+        open_change_anchors = (
+            "triggerButton:Dt,onOpenChange:c,children:[N,null]",
+            "open:s,onOpenChange:c,contentWidth:`panel`,triggerButton:Dt",
+        )
     else:
         raise RuntimeError(
             "no renderer compatibility map exists for "
@@ -904,6 +926,30 @@ def patch_renderer(
             component,
             component_identifier_replacements,
         )
+
+    if source_build == ("26.825.51511", "7377"):
+        query_client_pattern = re.compile(
+            r"(?P<prefix>\bconst\s+queryClient\s*=\s*)"
+            r"[A-Za-z_$][\w$]*\(\)"
+        )
+
+        component, query_client_replacements = (
+            query_client_pattern.subn(
+                lambda match: (
+                    match.group("prefix")
+                    + "k_($)"
+                ),
+                component,
+                count=1,
+            )
+        )
+
+        if query_client_replacements != 1:
+            raise RuntimeError(
+                "could not structurally retarget the 7377 "
+                "account-menu query client declaration; "
+                f"found {query_client_replacements} matches"
+            )
 
     if bundle.count(component_anchor) != 1:
         raise RuntimeError(
@@ -1011,12 +1057,28 @@ def patch_renderer(
 
     for anchor in open_change_anchors:
         if bundle.count(anchor) != 1:
-            raise RuntimeError("could not find a native profile menu open-state hook")
+            raise RuntimeError(
+                "could not find a native profile menu open-state hook"
+            )
+
+        open_change_match = re.search(
+            r"onOpenChange:(?P<handler>[A-Za-z_$][\\w$]*)",
+            anchor,
+        )
+
+        if open_change_match is None:
+            raise RuntimeError(
+                "profile menu open-state anchor has no handler"
+            )
+
+        open_change_handler = open_change_match.group("handler")
+
         bundle = bundle.replace(
             anchor,
             anchor.replace(
-                "onOpenChange:l",
-                "onOpenChange:CodexMuxProfileMenuOpenChange(l)",
+                f"onOpenChange:{open_change_handler}",
+                "onOpenChange:CodexMuxProfileMenuOpenChange("
+                f"{open_change_handler})",
             ),
             1,
         )
@@ -1176,7 +1238,7 @@ def patch_renderer(
             1,
         )
         plugin_bundle_path.write_text(plugin_bundle, encoding="utf-8")
-    else:
+    elif source_build == ("26.820.60940", "7119"):
         # 7119 profile page: keep the native profile transformer and add a
         # compact subscription selector beside the native Profile heading.
         profile_bundles = list((webview / "assets").glob("profile-*.js"))
@@ -1222,17 +1284,47 @@ def patch_renderer(
             file=sys.stderr,
         )
 
-    thread_bundles = [
+    else:
+        print(
+            "Warning: ChatGPT 26.825 keeps optional settings-page subscription "
+            "selectors disabled; use the profile-menu subscription selector. "
+            "Profile and plugin requests remain account-scoped through the "
+            "central bridge.",
+            file=sys.stderr,
+        )
+
+    thread_bundle_candidates = [
         path
-        for path in (webview / "assets").glob("local-conversation-thread-*.js")
+        for path in (webview / "assets").glob(
+            "local-conversation-thread-*.js"
+        )
         if "turn-entries" not in path.name
     ]
+
+    thread_bundles = []
+
+    for candidate_path in thread_bundle_candidates:
+        candidate_source = candidate_path.read_text(
+            encoding="utf-8"
+        )
+
+        if (
+            "routeKind===`local-thread`" in candidate_source
+            and "sectionKey:`usage`" in candidate_source
+        ):
+            thread_bundles.append(
+                (candidate_path, candidate_source)
+            )
+
     if len(thread_bundles) != 1:
         raise RuntimeError(
-            f"expected one local conversation renderer bundle, found {len(thread_bundles)}"
+            "could not uniquely identify the local conversation "
+            "renderer bundle structurally; "
+            f"found {len(thread_bundles)} matching candidates "
+            f"out of {len(thread_bundle_candidates)}"
         )
-    thread_bundle_path = thread_bundles[0]
-    thread_bundle = thread_bundle_path.read_text(encoding="utf-8")
+
+    thread_bundle_path, thread_bundle = thread_bundles[0]
     thread_component = (PROJECT_ROOT / "ui" / "thread-subscription.js").read_text(
         encoding="utf-8"
     )
@@ -1425,38 +1517,169 @@ def patch_desktop_profile(
         "a.app.setPath(`userData`,ee({appDataPath:a.app.getPath(`appData`),"
         "buildFlavor:X,env:process.env}))"
     )
-    if bootstrap.count(profile_anchor) != 1:
-        raise RuntimeError("could not isolate the copied ChatGPT desktop profile")
-    computer_use_pipe = json.dumps(str(DEFAULT_STATE_ROOT / "computer-use.sock"))
-    computer_use_app = json.dumps(str(installed_computer_use_app))
-    bootstrap = bootstrap.replace(
-        profile_anchor,
-        "process.env.SKY_CUA_SERVICE_NATIVE_PIPE_PATH="
-        f"{computer_use_pipe};"
-        "process.env.SKY_CUA_SERVICE_PATH="
-        f"{computer_use_app};"
-        "process.env.CODEX_ELECTRON_COMPUTER_USE_APP_PATH="
-        f"{computer_use_app};"
-        "process.env.CODEX_ELECTRON_SKIP_COMPUTER_USE_CANONICAL_REFRESH=`1`;"
-        "a.app.setPath(`userData`,"
-        f"a.app.getPath(`appData`)+`/{DESKTOP_PROFILE_NAME}`)",
-        1,
+
+    computer_use_pipe = json.dumps(
+        str(DEFAULT_STATE_ROOT / "computer-use.sock")
+    )
+    computer_use_app = json.dumps(
+        str(installed_computer_use_app)
     )
 
-    # The copied app must never replace itself with an unpatched official update.
-    updater_anchor = "await o.initialize();"
-    if bootstrap.count(updater_anchor) != 1:
-        raise RuntimeError("could not disable updates in the copied ChatGPT app")
-    bootstrap = bootstrap.replace(updater_anchor, "", 1)
-    bootstrap_path.write_text(bootstrap, encoding="utf-8")
+    legacy_profile_count = bootstrap.count(profile_anchor)
+    new_desktop_layout = False
 
-    main_files = list((extracted / ".vite" / "build").glob("main-*.js"))
+    if legacy_profile_count == 1:
+        bootstrap = bootstrap.replace(
+            profile_anchor,
+            "process.env.SKY_CUA_SERVICE_NATIVE_PIPE_PATH="
+            f"{computer_use_pipe};"
+            "process.env.SKY_CUA_SERVICE_PATH="
+            f"{computer_use_app};"
+            "process.env.CODEX_ELECTRON_COMPUTER_USE_APP_PATH="
+            f"{computer_use_app};"
+            "process.env.CODEX_ELECTRON_SKIP_COMPUTER_USE_CANONICAL_REFRESH=`1`;"
+            "a.app.setPath(`userData`,"
+            f"a.app.getPath(`appData`)+`/{DESKTOP_PROFILE_NAME}`)",
+            1,
+        )
+
+        updater_anchor = "await o.initialize();"
+        if bootstrap.count(updater_anchor) != 1:
+            raise RuntimeError(
+                "could not disable updates in the copied ChatGPT app"
+            )
+
+        bootstrap = bootstrap.replace(
+            updater_anchor,
+            "",
+            1,
+        )
+
+    elif legacy_profile_count == 0:
+        new_desktop_layout = True
+
+        profile_prefix = (
+            ";(()=>{"
+            "const __codexRouterElectron=require(`electron`);"
+            "process.env.SKY_CUA_SERVICE_NATIVE_PIPE_PATH="
+            f"{computer_use_pipe};"
+            "process.env.SKY_CUA_SERVICE_PATH="
+            f"{computer_use_app};"
+            "process.env.CODEX_ELECTRON_COMPUTER_USE_APP_PATH="
+            f"{computer_use_app};"
+            "process.env.CODEX_ELECTRON_SKIP_COMPUTER_USE_CANONICAL_REFRESH=`1`;"
+            "__codexRouterElectron.app.setPath("
+            "`userData`,"
+            "__codexRouterElectron.app.getPath(`appData`)"
+            f"+`/{DESKTOP_PROFILE_NAME}`"
+            ");"
+            "})();"
+        )
+
+        bootstrap = profile_prefix + bootstrap
+
+    else:
+        raise RuntimeError(
+            "could not uniquely isolate the copied ChatGPT desktop profile; "
+            f"legacy anchor count={legacy_profile_count}"
+        )
+
+    bootstrap_path.write_text(
+        bootstrap,
+        encoding="utf-8",
+    )
+
+    main_files = list(
+        (extracted / ".vite" / "build").glob("main-*.js")
+    )
     if len(main_files) != 1:
         raise RuntimeError(
             f"expected one ChatGPT desktop main bundle, found {len(main_files)}"
         )
+
     main_path = main_files[0]
     main = main_path.read_text(encoding="utf-8")
+
+    if new_desktop_layout:
+        updater_pattern = re.compile(
+            r"(?P<prefix>"
+            r"sparkleManager:new "
+            r"[A-Za-z_$][\w$]*"
+            r"\(\{enableUpdater:"
+            r")"
+            r"[A-Za-z_$][\w$]*"
+            r"\."
+            r"[A-Za-z_$][\w$]*"
+            r"\.shouldIncludeUpdater"
+            r"\("
+            r"[A-Za-z_$][\w$]*"
+            r",process\.platform,process\.env"
+            r"\)"
+            r"(?P<suffix>,buildFlavor:)"
+        )
+
+        updater_matches = []
+
+        build_dir = extracted / ".vite" / "build"
+
+        for candidate_path in sorted(build_dir.glob("*.js")):
+            candidate = candidate_path.read_text(
+                encoding="utf-8"
+            )
+
+            matches = list(
+                updater_pattern.finditer(candidate)
+            )
+
+            for match in matches:
+                updater_matches.append(
+                    (
+                        candidate_path,
+                        candidate,
+                        match,
+                    )
+                )
+
+        if len(updater_matches) != 1:
+            locations = [
+                str(candidate_path.name)
+                for candidate_path, _, _ in updater_matches
+            ]
+
+            raise RuntimeError(
+                "could not uniquely disable the new ChatGPT desktop updater; "
+                f"found {len(updater_matches)} structural matches "
+                f"in {locations}"
+            )
+
+        (
+            updater_path,
+            updater_source,
+            updater_match,
+        ) = updater_matches[0]
+
+        updater_source = (
+            updater_source[:updater_match.start()]
+            + updater_match.group("prefix")
+            + "!1"
+            + updater_match.group("suffix")
+            + updater_source[updater_match.end():]
+        )
+
+        if updater_pattern.search(updater_source):
+            raise RuntimeError(
+                "new ChatGPT desktop updater remained enabled "
+                "after structural replacement"
+            )
+
+        if updater_path == main_path:
+            main = updater_source
+        else:
+            updater_path.write_text(
+                updater_source,
+                encoding="utf-8",
+            )
+
     managed_service_pattern = re.compile(
         r"(?P<prefix>[A-Za-z_$][\w$]*=new [A-Za-z_$][\w$]*\()"
         r"[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\.codexHome\)"
