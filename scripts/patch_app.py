@@ -47,6 +47,10 @@ OPENAI_INTERNAL_TEAM_IDENTIFIER = "HX7739G8FX"
 OPENAI_DISTRIBUTION_TEAM_IDENTIFIER = "2DC432GLL2"
 TESTED_SOURCE_BUILDS = {
     (
+        "26.831.21537",
+        "7579",
+    ): "4df5376dd69ec8fd1d99c7e590982d8a10b762116ceb1961c0e2addcc08b07fa",
+    (
         "26.818.61809",
         "7019",
     ): "76bbcdc2a4a2d77cfe03904a6537d0a655f9892f27a8925e3a6c7b613801d4cf",
@@ -818,6 +822,465 @@ def replace_javascript_identifiers(
     return source
 
 
+def patch_renderer_26831(
+    webview: Path,
+    token: str,
+) -> None:
+    """
+    Patch ChatGPT 26.831 / build 7579.
+
+    26.831 splits renderer responsibilities across app-initial and app-primary.
+    Cross-chunk mux hooks therefore use globalThis bridges with native fallbacks.
+    """
+
+    assets = webview / "assets"
+
+    initial_bundles = list(
+        assets.glob("app-initial-*.js")
+    )
+    if len(initial_bundles) != 1:
+        raise RuntimeError(
+            "expected one ChatGPT initial renderer bundle for 26.831, "
+            f"found {len(initial_bundles)}"
+        )
+
+    primary_bundles = list(
+        assets.glob("app-primary-*.js")
+    )
+    if len(primary_bundles) != 1:
+        raise RuntimeError(
+            "expected one ChatGPT primary renderer bundle for 26.831, "
+            f"found {len(primary_bundles)}"
+        )
+
+    initial_path = initial_bundles[0]
+    primary_path = primary_bundles[0]
+
+    initial_bundle = initial_path.read_text(
+        encoding="utf-8"
+    )
+    primary_bundle = primary_path.read_text(
+        encoding="utf-8"
+    )
+
+    if (
+        "function CodexMuxAccountMenu(" in initial_bundle
+        or "function CodexMuxAccountMenu(" in primary_bundle
+    ):
+        raise RuntimeError(
+            "source app already contains the Codex multiplexer menu"
+        )
+
+    component = (
+        PROJECT_ROOT / "ui" / "account-menu.js"
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    component = component.replace(
+        "__CODEX_MUX_CONTROL_PORT__",
+        str(CONTROL_PORT),
+    )
+    component = component.replace(
+        "__CODEX_MUX_CONTROL_TOKEN__",
+        token,
+    )
+
+    # 26.831 app-primary bindings:
+    #   BJ  = JSX runtime
+    #   Iln = React namespace
+    #   kE  = TanStack query client hook
+    component = replace_javascript_identifiers(
+        component,
+        {
+            "d7": "BJ",
+            "Esc": "Iln",
+        },
+    )
+
+    query_client_pattern = re.compile(
+        r"(?<![A-Za-z0-9_$])ct\(\)(?![A-Za-z0-9_$])"
+    )
+
+    component, query_client_replacements = (
+        query_client_pattern.subn(
+            "kE()",
+            component,
+        )
+    )
+
+    if query_client_replacements != 2:
+        raise RuntimeError(
+            "could not retarget both 26.831 account-menu "
+            "query-client hooks; "
+            f"found {query_client_replacements}"
+        )
+
+    required_helpers = (
+        "codexMuxScopePluginRequest",
+        "codexMuxProfileData",
+        "codexMuxPooledUsageStatus",
+    )
+
+    for helper_name in required_helpers:
+        if helper_name not in component:
+            raise RuntimeError(
+                "injected account menu is missing required helper "
+                f"{helper_name!r}"
+            )
+
+    # app-primary and app-initial are now separate chunks.
+    # Publish only the helpers that app-initial needs.
+    component += (
+        "\n"
+        "globalThis.__codexMuxScopePluginRequest="
+        "codexMuxScopePluginRequest;\n"
+        "globalThis.__codexMuxProfileData="
+        "codexMuxProfileData;\n"
+        "globalThis.__codexMuxPooledUsageStatus="
+        "codexMuxPooledUsageStatus;\n"
+    )
+
+    # ========================================================
+    # app-primary: account/profile UI
+    # ========================================================
+
+    component_anchor = (
+        "function jln(e){let t=(0,zJ.c)(222),"
+        "{sidebarFooter:n,triggerButton:r}=e"
+    )
+
+    component_count = primary_bundle.count(
+        component_anchor
+    )
+
+    if component_count != 1:
+        raise RuntimeError(
+            "could not uniquely locate the 26.831 native "
+            "profile menu component; "
+            f"found {component_count}"
+        )
+
+    primary_bundle = primary_bundle.replace(
+        component_anchor,
+        component + "\n" + component_anchor,
+        1,
+    )
+
+    usage_anchor = "usageItems:Ct"
+    usage_anchor_count = primary_bundle.count(
+        usage_anchor
+    )
+
+    if usage_anchor_count != 1:
+        raise RuntimeError(
+            "could not uniquely locate the 26.831 native "
+            "usage menu slot; "
+            f"found {usage_anchor_count}"
+        )
+
+    primary_bundle = primary_bundle.replace(
+        usage_anchor,
+        "usageItems:(0,BJ.jsx)"
+        "(CodexMuxAccountMenu,{})",
+        1,
+    )
+
+    open_change_anchors = (
+        (
+            "triggerButton:Dt,"
+            "onOpenChange:c,"
+            "children:[F,null]"
+        ),
+        (
+            "open:s,"
+            "onOpenChange:c,"
+            "contentWidth:`panel`,"
+            "triggerButton:Dt"
+        ),
+    )
+
+    for anchor in open_change_anchors:
+        count = primary_bundle.count(anchor)
+
+        if count != 1:
+            raise RuntimeError(
+                "could not uniquely locate a 26.831 "
+                "profile-menu open-state hook; "
+                f"anchor={anchor!r}, count={count}"
+            )
+
+        match = re.search(
+            r"onOpenChange:"
+            r"(?P<handler>[A-Za-z_$][\w$]*)",
+            anchor,
+        )
+
+        if match is None:
+            raise RuntimeError(
+                "26.831 profile-menu open-state anchor "
+                "has no handler"
+            )
+
+        handler = match.group("handler")
+
+        primary_bundle = primary_bundle.replace(
+            anchor,
+            anchor.replace(
+                f"onOpenChange:{handler}",
+                "onOpenChange:"
+                "CodexMuxProfileMenuOpenChange("
+                f"{handler})",
+            ),
+            1,
+        )
+
+    # ========================================================
+    # app-initial: Plugins RPC mapping
+    # ========================================================
+
+    plugin_rpc_mapping_anchors = (
+        (
+            "qb(e,n).sendRequest(`app/list`,"
+            "{cursor:i,limit:Nfi,forceRefetch:t},"
+            "{trace:a})"
+        ),
+        (
+            "qb(e,n).sendRequest(`app/installed`,"
+            "t?{forceRefresh:!0}:{})"
+        ),
+        (
+            "map(t=>qb(e,n).sendRequest(`app/read`,"
+            "{appIds:t}))"
+        ),
+        '"mcpServer/oauth/login":`mcp`',
+        (
+            "listMcpServers(e,t){"
+            "let n=JSON.stringify({options:t,params:e})"
+        ),
+        (
+            "let i=this.sendRequest("
+            "`mcpServerStatus/list`,e,t);"
+        ),
+    )
+
+    for anchor in plugin_rpc_mapping_anchors:
+        count = initial_bundle.count(anchor)
+
+        if count != 1:
+            raise RuntimeError(
+                "could not verify the 26.831 native Plugins "
+                "request-to-RPC mapping; "
+                f"anchor={anchor!r}, count={count}"
+            )
+
+    # ========================================================
+    # app-initial: app-server request bridge
+    # ========================================================
+
+    app_server_request_pattern = re.compile(
+        r"async sendRequest\("
+        r"(?P<method>[A-Za-z_$][\w$]*),"
+        r"(?P<params>[A-Za-z_$][\w$]*),"
+        r"(?P<options>[A-Za-z_$][\w$]*)"
+        r"\)\{"
+        r"(?=.{0,2500}?this\.dispatchMessage)"
+        r"(?=.{0,5000}?this\.enqueueRequest)",
+        re.DOTALL,
+    )
+
+    app_server_matches = list(
+        app_server_request_pattern.finditer(
+            initial_bundle
+        )
+    )
+
+    if len(app_server_matches) != 1:
+        raise RuntimeError(
+            "could not uniquely identify the 26.831 "
+            "native app-server request bridge; "
+            f"found {len(app_server_matches)} candidates"
+        )
+
+    app_server_match = app_server_matches[0]
+    method_var = app_server_match.group("method")
+    params_var = app_server_match.group("params")
+
+    bridge_injection = (
+        app_server_match.group(0)
+        + "if(globalThis.__codexMuxScopePluginRequest){"
+        + f"{params_var}="
+        + "globalThis.__codexMuxScopePluginRequest("
+        + f"{method_var},{params_var});"
+        + "}"
+    )
+
+    initial_bundle = (
+        initial_bundle[:app_server_match.start()]
+        + bridge_injection
+        + initial_bundle[app_server_match.end():]
+    )
+
+    # ========================================================
+    # app-initial: /wham/profiles/me
+    # ========================================================
+
+    profile_query_pattern = re.compile(
+        r"let "
+        r"(?P<result>[A-Za-z_$][\w$]*)"
+        r"=await "
+        r"[A-Za-z_$][\w$]*"
+        r"(?:\.[A-Za-z_$][\w$]*)*"
+        r"\.safeGet\(`/wham/profiles/me`\)"
+    )
+
+    profile_matches = list(
+        profile_query_pattern.finditer(
+            initial_bundle
+        )
+    )
+
+    if len(profile_matches) != 1:
+        pos = initial_bundle.find(
+            "/wham/profiles/me"
+        )
+
+        sample = (
+            initial_bundle[
+                max(0, pos - 500):
+                pos + 500
+            ]
+            if pos != -1
+            else "endpoint not found"
+        )
+
+        raise RuntimeError(
+            "could not uniquely identify the 26.831 "
+            "native profile stats request; "
+            f"found {len(profile_matches)} candidates; "
+            f"sample={sample}"
+        )
+
+    profile_match = profile_matches[0]
+    profile_result = profile_match.group(
+        "result"
+    )
+
+    native_profile_expression = (
+        profile_match.group(0)
+        .split("=", 1)[1]
+    )
+
+    profile_replacement = (
+        f"let {profile_result}="
+        "globalThis.__codexMuxProfileData?"
+        "await globalThis.__codexMuxProfileData("
+        "globalThis.__codexMuxSelectedProfileAccountId??null"
+        "):"
+        + native_profile_expression
+    )
+
+    initial_bundle = (
+        initial_bundle[:profile_match.start()]
+        + profile_replacement
+        + initial_bundle[profile_match.end():]
+    )
+
+    # ========================================================
+    # app-initial: /wham/usage normalization
+    #
+    # 26.831 added model_picker_upsell and rate_limit_warning.
+    # ========================================================
+
+    wham_usage_pattern = re.compile(
+        r"(?P<result>[A-Za-z_$][\w$]*)="
+        r"\{\.\.\."
+        r"(?P<base>[A-Za-z_$][\w$]*),"
+        r"rate_limit_upsell:"
+        r"(?P<parsed>[A-Za-z_$][\w$]*)"
+        r"\.success\?"
+        r"(?P=parsed)"
+        r"\.data\.rate_limit_upsell:"
+        r"void 0"
+        r"(?P<additional_fields>"
+        r"(?:,[A-Za-z_$][\w$]*:"
+        r"[^;{}]{1,1000})*"
+        r")"
+        r"\};"
+        r"return "
+        r"(?P<store>[A-Za-z_$][\w$]*)"
+        r"\("
+        r"(?P<scope>[A-Za-z_$][\w$]*),"
+        r"(?P=result)"
+        r"\),"
+        r"(?P=result)"
+    )
+
+    usage_matches = list(
+        wham_usage_pattern.finditer(
+            initial_bundle
+        )
+    )
+
+    if len(usage_matches) != 1:
+        pos = initial_bundle.find(
+            "rate_limit_upsell:"
+        )
+
+        sample = (
+            initial_bundle[
+                max(0, pos - 700):
+                pos + 1400
+            ]
+            if pos != -1
+            else "rate_limit_upsell not found"
+        )
+
+        raise RuntimeError(
+            "could not uniquely identify the 26.831 "
+            "/wham/usage normalizer; "
+            f"found {len(usage_matches)} candidates; "
+            f"sample={sample}"
+        )
+
+    usage_match = usage_matches[0]
+    usage_result = usage_match.group("result")
+    usage_store = usage_match.group("store")
+    usage_scope = usage_match.group("scope")
+
+    normalized = (
+        usage_match.group(0)
+        .split(";return ", 1)[0]
+    )
+
+    usage_replacement = (
+        normalized
+        + ";if(globalThis.__codexMuxPooledUsageStatus){"
+        + f"{usage_result}=await "
+        + "globalThis.__codexMuxPooledUsageStatus("
+        + f"{usage_result});"
+        + "}"
+        + f"return {usage_store}("
+        + f"{usage_scope},{usage_result}"
+        + f"),{usage_result}"
+    )
+
+    initial_bundle = (
+        initial_bundle[:usage_match.start()]
+        + usage_replacement
+        + initial_bundle[usage_match.end():]
+    )
+
+    primary_path.write_text(
+        primary_bundle,
+        encoding="utf-8",
+    )
+
+    initial_path.write_text(
+        initial_bundle,
+        encoding="utf-8",
+    )
+
 def patch_renderer(
     extracted: Path,
     token: str,
@@ -836,6 +1299,13 @@ def patch_renderer(
         1,
     )
     index_path.write_text(index, encoding="utf-8")
+
+    if source_build == ("26.831.21537", "7579"):
+        patch_renderer_26831(
+            webview,
+            token,
+        )
+        return
 
     initial_bundles = list((webview / "assets").glob("app-initial-*.js"))
     if len(initial_bundles) != 1:
