@@ -886,3 +886,142 @@ func TestQuotaRebalanceBoundaryAllowsIdleRoot(
 		)
 	}
 }
+
+func TestQuotaRebalanceEventBoundaryAcquiresRecoveryLease(
+	t *testing.T,
+) {
+	m :=
+		&Multiplexer{
+			activeTurns: map[string]activeTurn{
+				"root-1": {
+					accountID:                "account-1",
+					turnID:                   "turn-root",
+					generation:               4,
+					rebalanceTarget:          "account-2",
+					rebalanceBoundaryPending: true,
+				},
+			},
+			threadParents: make(
+				map[string]string,
+			),
+			commandPIDs: make(
+				map[string]map[int]string,
+			),
+			now: time.Now,
+		}
+
+	plan, active, ok :=
+		m.claimQuotaRebalanceBoundary(
+			"root-1",
+			"account-1",
+		)
+
+	if !ok {
+		t.Fatal(
+			"safe event boundary was not claimed",
+		)
+	}
+
+	if plan.target != "account-2" {
+		t.Fatalf(
+			"target=%q want account-2",
+			plan.target,
+		)
+	}
+
+	if plan.generation != 5 ||
+		active.generation != 5 {
+		t.Fatalf(
+			"generation plan=%d active=%d want 5",
+			plan.generation,
+			active.generation,
+		)
+	}
+
+	current :=
+		m.activeTurns["root-1"]
+
+	if !current.recovering {
+		t.Fatal(
+			"boundary claim did not acquire recovery lease",
+		)
+	}
+
+	if current.rebalanceBoundaryPending {
+		t.Fatal(
+			"claimed boundary remained pending",
+		)
+	}
+
+	if current.rebalanceTarget != "" {
+		t.Fatal(
+			"claimed target remained pending",
+		)
+	}
+}
+
+func TestQuotaRebalanceEventBoundaryRejectsClosedBoundary(
+	t *testing.T,
+) {
+	m :=
+		&Multiplexer{
+			activeTurns: map[string]activeTurn{
+				"root-1": {
+					accountID:                "account-1",
+					turnID:                   "turn-root",
+					generation:               4,
+					rebalanceTarget:          "account-2",
+					rebalanceBoundaryPending: false,
+				},
+			},
+			threadParents: make(
+				map[string]string,
+			),
+			commandPIDs: make(
+				map[string]map[int]string,
+			),
+			now: time.Now,
+		}
+
+	_, _, ok :=
+		m.claimQuotaRebalanceBoundary(
+			"root-1",
+			"account-1",
+		)
+
+	if ok {
+		t.Fatal(
+			"closed lifecycle boundary was claimed",
+		)
+	}
+}
+
+func TestDescendantActivityClosesRootRebalanceBoundary(
+	t *testing.T,
+) {
+	m :=
+		&Multiplexer{
+			activeTurns: map[string]activeTurn{
+				"root-1": {
+					accountID:                "account-1",
+					turnID:                   "turn-root",
+					rebalanceBoundaryPending: true,
+				},
+			},
+			threadParents: map[string]string{
+				"child-1": "root-1",
+			},
+		}
+
+	m.clearQuotaRebalanceBoundary(
+		"child-1",
+		"account-1",
+	)
+
+	if m.activeTurns["root-1"].
+		rebalanceBoundaryPending {
+		t.Fatal(
+			"descendant activity did not close root boundary",
+		)
+	}
+}

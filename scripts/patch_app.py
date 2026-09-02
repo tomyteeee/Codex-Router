@@ -1913,8 +1913,12 @@ def patch_app(
 
         backup_suffix = time.strftime("%Y%m%d-%H%M%S")
         backup_directory = DEFAULT_STATE_ROOT / "backups" / backup_suffix
-        app_backup = backup_directory / destination.name
-        helper_backup = backup_directory / installed_computer_use_app.name
+        # Backups must receive a new filesystem identity and must not
+        # remain discoverable launchable .app bundles.
+        app_backup = backup_directory / f"{destination.name}.backup"
+        helper_backup = (
+            backup_directory / f"{installed_computer_use_app.name}.backup"
+        )
         had_app = destination.exists()
         had_helper = installed_computer_use_app.exists()
         if had_app or had_helper:
@@ -1923,11 +1927,22 @@ def patch_app(
             backup_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
         try:
             if had_app:
-                destination.rename(app_backup)
-                print(f"Existing copy moved to {app_backup}")
+                run(["ditto", str(destination), str(app_backup)])
+                shutil.rmtree(destination)
+                print(f"Existing copy backed up to {app_backup}")
             if had_helper:
-                installed_computer_use_app.rename(helper_backup)
-                print(f"Existing Computer Use helper moved to {helper_backup}")
+                run(
+                    [
+                        "ditto",
+                        str(installed_computer_use_app),
+                        str(helper_backup),
+                    ]
+                )
+                shutil.rmtree(installed_computer_use_app)
+                print(
+                    "Existing Computer Use helper backed up to "
+                    f"{helper_backup}"
+                )
             staged_app.rename(destination)
             staged_computer_use_app.rename(installed_computer_use_app)
         except OSError:

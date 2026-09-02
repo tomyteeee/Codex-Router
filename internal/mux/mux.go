@@ -52,8 +52,9 @@ type activeTurn struct {
 
 	// Proactive quota balancing is deliberately separate from emergency
 	// recovery. A target is only acted on at a safe autonomous boundary.
-	rebalanceTarget string
-	lastRebalance   time.Time
+	rebalanceTarget          string
+	rebalanceBoundaryPending bool
+	lastRebalance            time.Time
 }
 
 type quotaBucket string
@@ -396,6 +397,10 @@ type Multiplexer struct {
 
 	runCtx context.Context
 
+	// Event-driven quota pacing. Capacity one coalesces bursts while
+	// retaining a wake for the newest known state.
+	quotaBalanceWake chan struct{}
+
 	serverMu       sync.Mutex
 	serverRoutes   map[string]serverRequestRoute
 	serverSequence atomic.Uint64
@@ -444,6 +449,7 @@ func New(options Options) (*Multiplexer, error) {
 		output:                 options.Output,
 		children:               make(map[string]*backend.Child),
 		inbound:                make(chan backend.Inbound, 1024),
+		quotaBalanceWake:       make(chan struct{}, 1),
 		outputQueue:            make(chan []byte, 4096),
 		externalRoutes:         make(map[string]externalRoute),
 		activeTurns:            make(map[string]activeTurn),
@@ -912,9 +918,12 @@ func (m *Multiplexer) rememberActiveTurn(
 	active.recoveryCause = ""
 	active.agentMessageComplete = false
 	active.rebalanceTarget = ""
+	active.rebalanceBoundaryPending = false
 
 	m.activeTurns[threadID] = active
 	m.activeTurnMu.Unlock()
+
+	m.requestQuotaBalance()
 }
 
 func (m *Multiplexer) activeTurnFor(
@@ -1519,6 +1528,8 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 	}
 
 	if message.Method == "account/rateLimits/updated" {
+		m.requestQuotaBalance()
+
 		m.scheduleAggregatedRateLimitNotification(
 			inbound.Raw,
 		)

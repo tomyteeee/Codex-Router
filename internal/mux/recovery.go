@@ -414,6 +414,7 @@ func (m *Multiplexer) supersedeRecoveryForUserTurn(
 	active.recoveryCause = ""
 	active.failureRaw = nil
 	active.rebalanceTarget = ""
+	active.rebalanceBoundaryPending = false
 	active.lastActivity = m.now()
 
 	m.activeTurns[root] = active
@@ -514,6 +515,8 @@ func (m *Multiplexer) beginRecovery(
 	}
 
 	active.accountID = sourceAccountID
+	active.rebalanceTarget = ""
+	active.rebalanceBoundaryPending = false
 	active.recovering = true
 	active.parked = false
 
@@ -1154,6 +1157,8 @@ func (m *Multiplexer) observeRecoveryNotification(
 			inbound.AccountID,
 			message.Params,
 		)
+
+		m.requestQuotaBalance()
 	}
 
 	m.trackCommandLifecycle(
@@ -1194,6 +1199,11 @@ func (m *Multiplexer) observeRecoveryNotification(
 
 	if method == "item/started" &&
 		threadID != "" {
+		m.clearQuotaRebalanceBoundary(
+			threadID,
+			inbound.AccountID,
+		)
+
 		m.setAgentMessageComplete(
 			threadID,
 			inbound.AccountID,

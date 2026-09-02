@@ -2,15 +2,19 @@ package mux
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
 )
 
 const (
-	quotaBalanceInterval      = 60 * time.Second
-	quotaRebalanceCooldown    = 5 * time.Minute
-	quotaRebalanceBoundaryLag = 100 * time.Millisecond
+	// Correctness is event-driven. This is only a liveness watchdog if
+	// an upstream lifecycle/quota notification is ever lost.
+	quotaBalanceFallbackInterval = 5 * time.Minute
+
+	// Hysteresis, not boundary detection.
+	quotaRebalanceCooldown = 5 * time.Minute
 )
 
 type quotaRebalancePlan struct {
@@ -28,32 +32,59 @@ func (m *Multiplexer) quotaRebalanceNow() time.Time {
 	return time.Now()
 }
 
+func (m *Multiplexer) requestQuotaBalance() {
+	if m.quotaBalanceWake == nil {
+		return
+	}
+
+	select {
+	case m.quotaBalanceWake <- struct{}{}:
+	default:
+		// Coalesce bursts. The queued pass observes newest state.
+	}
+}
+
+func (m *Multiplexer) runQuotaBalancePass(
+	ctx context.Context,
+) {
+	passCtx, cancel :=
+		context.WithTimeout(
+			ctx,
+			2*requestTimeout,
+		)
+	defer cancel()
+
+	m.planQuotaRebalances(
+		passCtx,
+	)
+}
+
 func (m *Multiplexer) quotaBalanceLoop(
 	ctx context.Context,
 ) {
 	ticker :=
 		time.NewTicker(
-			quotaBalanceInterval,
+			quotaBalanceFallbackInterval,
 		)
 	defer ticker.Stop()
+
+	m.requestQuotaBalance()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
-		case <-ticker.C:
-			passCtx, cancel :=
-				context.WithTimeout(
-					ctx,
-					2*requestTimeout,
-				)
-
-			m.planQuotaRebalances(
-				passCtx,
+		case <-m.quotaBalanceWake:
+			m.runQuotaBalancePass(
+				ctx,
 			)
 
-			cancel()
+		case <-ticker.C:
+			// Watchdog only.
+			m.runQuotaBalancePass(
+				ctx,
+			)
 		}
 	}
 }
@@ -280,7 +311,6 @@ func (m *Multiplexer) setPlannedQuotaRebalance(
 	}
 
 	m.activeTurnMu.Lock()
-	defer m.activeTurnMu.Unlock()
 
 	active, ok :=
 		m.activeTurns[root]
@@ -291,21 +321,36 @@ func (m *Multiplexer) setPlannedQuotaRebalance(
 		active.recovering ||
 		active.parked ||
 		active.agentMessageComplete {
+		m.activeTurnMu.Unlock()
 		return false
 	}
 
-	if active.rebalanceTarget ==
-		target {
-		return false
-	}
+	changed :=
+		active.rebalanceTarget !=
+			target
 
 	active.rebalanceTarget =
 		target
 
+	boundaryPending :=
+		active.rebalanceBoundaryPending
+
 	m.activeTurns[root] =
 		active
 
-	return true
+	m.activeTurnMu.Unlock()
+
+	// quota calculation and execution events race in either direction.
+	// If item/completed won first and no new item started, consume that
+	// still-open boundary now.
+	if boundaryPending {
+		m.maybeRunQuotaRebalanceBoundary(
+			root,
+			source,
+		)
+	}
+
+	return changed
 }
 
 func (m *Multiplexer) clearPlannedQuotaRebalance(
@@ -362,10 +407,9 @@ func (m *Multiplexer) restorePlannedQuotaRebalance(
 		active
 }
 
-func (m *Multiplexer) scheduleQuotaRebalanceBoundary(
+func (m *Multiplexer) quotaRebalanceRoot(
 	threadID string,
-	accountID string,
-) {
+) string {
 	root :=
 		m.rootThreadID(
 			threadID,
@@ -375,8 +419,23 @@ func (m *Multiplexer) scheduleQuotaRebalanceBoundary(
 		root = threadID
 	}
 
-	if root == "" {
-		return
+	return root
+}
+
+func (m *Multiplexer) markQuotaRebalanceBoundary(
+	threadID string,
+	accountID string,
+) string {
+	root :=
+		m.quotaRebalanceRoot(
+			threadID,
+		)
+
+	// A descendant's item completion is not itself a root autonomous
+	// boundary. The root lifecycle must expose the boundary.
+	if root == "" ||
+		root != threadID {
+		return ""
 	}
 
 	m.activeTurnMu.Lock()
@@ -384,60 +443,92 @@ func (m *Multiplexer) scheduleQuotaRebalanceBoundary(
 	active, ok :=
 		m.activeTurns[root]
 
-	pending :=
-		ok &&
-			active.rebalanceTarget != "" &&
-			(accountID == "" ||
-				active.accountID ==
-					accountID)
+	if ok &&
+		active.turnID != "" &&
+		(accountID == "" ||
+			active.accountID ==
+				accountID) &&
+		!active.recovering &&
+		!active.parked &&
+		!active.agentMessageComplete {
+		active.rebalanceBoundaryPending =
+			true
+
+		m.activeTurns[root] =
+			active
+	}
 
 	m.activeTurnMu.Unlock()
 
-	if !pending {
+	return root
+}
+
+func (m *Multiplexer) clearQuotaRebalanceBoundary(
+	threadID string,
+	accountID string,
+) {
+	root :=
+		m.quotaRebalanceRoot(
+			threadID,
+		)
+
+	if root == "" {
 		return
 	}
 
-	go func() {
-		timer :=
-			time.NewTimer(
-				quotaRebalanceBoundaryLag,
-			)
-		defer timer.Stop()
+	// Activity anywhere in the execution tree closes the old root boundary.
+	m.activeTurnMu.Lock()
 
-		ctx := m.runCtx
+	active, ok :=
+		m.activeTurns[root]
 
-		if ctx == nil {
-			<-timer.C
-		} else {
-			select {
-			case <-ctx.Done():
-				return
+	if ok &&
+		(accountID == "" ||
+			active.accountID ==
+				accountID) {
+		active.rebalanceBoundaryPending =
+			false
 
-			case <-timer.C:
-			}
-		}
+		m.activeTurns[root] =
+			active
+	}
 
-		m.maybeRunQuotaRebalanceBoundary(
-			root,
+	m.activeTurnMu.Unlock()
+}
+
+func (m *Multiplexer) scheduleQuotaRebalanceBoundary(
+	threadID string,
+	accountID string,
+) {
+	// Every completion is useful pacing information, including descendants.
+	m.requestQuotaBalance()
+
+	root :=
+		m.markQuotaRebalanceBoundary(
+			threadID,
 			accountID,
 		)
-	}()
+
+	if root == "" {
+		return
+	}
+
+	// item/completed is itself the event boundary.
+	// No 100 ms sleep and no wall-clock sampling.
+	m.maybeRunQuotaRebalanceBoundary(
+		root,
+		accountID,
+	)
 }
 
 func (m *Multiplexer) maybeRunQuotaRebalanceBoundary(
 	root string,
 	accountID string,
 ) {
-	if !m.quotaRebalanceBoundarySafe(
-		root,
-		accountID,
-		0,
-	) {
-		return
-	}
-
-	plan, ok :=
-		m.claimQuotaRebalancePlan(
+	plan,
+		active,
+		ok :=
+		m.claimQuotaRebalanceBoundary(
 			root,
 			accountID,
 		)
@@ -446,9 +537,120 @@ func (m *Multiplexer) maybeRunQuotaRebalanceBoundary(
 		return
 	}
 
-	m.executeQuotaRebalance(
+	// Safe boundary ownership has already been converted into the normal
+	// generation/recovery lease. Slow recovery work can now be asynchronous.
+	go m.executeQuotaRebalance(
 		plan,
+		active,
 	)
+}
+
+func (m *Multiplexer) claimQuotaRebalanceBoundary(
+	root string,
+	accountID string,
+) (
+	quotaRebalancePlan,
+	activeTurn,
+	bool,
+) {
+	if !m.quotaRebalanceBoundarySafe(
+		root,
+		accountID,
+		0,
+	) {
+		return quotaRebalancePlan{},
+			activeTurn{},
+			false
+	}
+
+	m.activeTurnMu.Lock()
+
+	active, ok :=
+		m.activeTurns[root]
+
+	if !ok ||
+		active.accountID == "" ||
+		active.turnID == "" ||
+		active.rebalanceTarget == "" ||
+		!active.rebalanceBoundaryPending ||
+		(accountID != "" &&
+			active.accountID !=
+				accountID) ||
+		active.recovering ||
+		active.parked ||
+		active.agentMessageComplete {
+		m.activeTurnMu.Unlock()
+
+		return quotaRebalancePlan{},
+			activeTurn{},
+			false
+	}
+
+	if !active.lastRebalance.IsZero() &&
+		m.quotaRebalanceNow().Sub(
+			active.lastRebalance,
+		) < quotaRebalanceCooldown {
+		m.activeTurnMu.Unlock()
+
+		return quotaRebalancePlan{},
+			activeTurn{},
+			false
+	}
+
+	target :=
+		active.rebalanceTarget
+
+	// Critical transition:
+	//
+	// item/completed boundary
+	//        ->
+	// generation/recovery lease
+	//
+	// There is no arbitrary delay between these concepts.
+	active.rebalanceTarget = ""
+	active.rebalanceBoundaryPending = false
+	active.recovering = true
+	active.parked = false
+	active.generation++
+	active.lastActivity =
+		m.quotaRebalanceNow()
+
+	m.activeTurns[root] =
+		active
+
+	plan :=
+		quotaRebalancePlan{
+			root:       root,
+			source:     active.accountID,
+			target:     target,
+			generation: active.generation,
+		}
+
+	snapshot :=
+		active
+
+	snapshot.params =
+		append(
+			json.RawMessage(nil),
+			active.params...,
+		)
+
+	snapshot.excluded =
+		cloneAccountSet(
+			active.excluded,
+		)
+
+	snapshot.failureRaw =
+		append(
+			[]byte(nil),
+			active.failureRaw...,
+		)
+
+	m.activeTurnMu.Unlock()
+
+	return plan,
+		snapshot,
+		true
 }
 
 func (m *Multiplexer) claimQuotaRebalancePlan(
@@ -734,70 +936,13 @@ func (m *Multiplexer) noteQuotaRebalanceFinished(
 
 func (m *Multiplexer) executeQuotaRebalance(
 	plan quotaRebalancePlan,
+	active activeTurn,
 ) {
-	ctx, cancel :=
-		context.WithTimeout(
-			context.Background(),
-			2*requestTimeout,
-		)
-
-	decision,
-		sourceState,
-		targetState,
-		valid :=
-		m.validateQuotaRebalancePlan(
-			ctx,
-			plan,
-		)
-
-	cancel()
-
-	if !valid {
-		fmt.Fprintf(
-			os.Stderr,
-			"codex-mux: quota rebalance suppressed thread=%s source=%s target=%s reason=STALE_OR_NO_LONGER_BETTER source={%s} target={%s}\n",
-			plan.root,
-			plan.source,
-			plan.target,
-			quotaPacingSummary(
-				sourceState,
-			),
-			quotaPacingSummary(
-				targetState,
-			),
-		)
-		return
-	}
-
-	if !m.quotaRebalanceBoundarySafe(
+	if !m.recoveryLeaseCurrent(
 		plan.root,
 		plan.source,
-		plan.generation,
+		active.generation,
 	) {
-		m.restorePlannedQuotaRebalance(
-			plan,
-		)
-		return
-	}
-
-	active, ok :=
-		m.beginRecovery(
-			plan.root,
-			plan.source,
-		)
-
-	if !ok {
-		return
-	}
-
-	if !m.quotaRebalanceTreeIdle(
-		plan.root,
-	) {
-		m.setRecoveryFailed(
-			plan.root,
-			plan.source,
-			active.generation,
-		)
 		return
 	}
 
@@ -809,6 +954,12 @@ func (m *Multiplexer) executeQuotaRebalance(
 	m.bestEffortInterruptTree(
 		plan.root,
 		plan.source,
+	)
+
+	// If work raced immediately after item/completed, the already-acquired
+	// boundary lease wins. Do not let that raced command pin the source.
+	m.terminateTrackedCommands(
+		plan.root,
 	)
 
 	time.Sleep(
@@ -826,7 +977,7 @@ func (m *Multiplexer) executeQuotaRebalance(
 			plan.source,
 			active,
 			targetOnly,
-			"proactive reset-aware quota rebalance",
+			"proactive event-driven quota rebalance",
 			false,
 		)
 
@@ -844,7 +995,7 @@ func (m *Multiplexer) executeQuotaRebalance(
 				plan.source,
 				active,
 				nil,
-				"proactive reset-aware quota rebalance fallback",
+				"proactive event-driven quota rebalance fallback",
 				true,
 			)
 	}
@@ -858,7 +1009,7 @@ func (m *Multiplexer) executeQuotaRebalance(
 			m.setRecoveryParked(
 				plan.root,
 				plan.source,
-				"proactive reset-aware quota rebalance retry",
+				"proactive event-driven quota rebalance retry",
 				nil,
 				active.generation,
 			) {
@@ -874,7 +1025,9 @@ func (m *Multiplexer) executeQuotaRebalance(
 		plan.root,
 		plan.source,
 		active.generation,
-		decision.reason,
-		decision.advantage,
+		"event-driven pacing",
+		0,
 	)
+
+	m.requestQuotaBalance()
 }
